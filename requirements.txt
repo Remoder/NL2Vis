@@ -1,0 +1,12 @@
+pandas
+matplotlib
+langchain_core
+openai
+attrs
+cairosvg
+langchain
+llmx
+duckdb
+func_timeout
+dotenv
+sqlglot
