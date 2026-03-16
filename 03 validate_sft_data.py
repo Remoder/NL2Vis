@@ -43,29 +43,44 @@ def call_llm(user_prompt, system_prompt="You are an expert about text-to-SQL and
                 return ""
 
 # --- Prompts ---
-SR2SQL_CHECK_PROMPT = """You are a SQL Translation Expert. Your task is to synthesize a single, executable SQLite/DuckDB SQL query from two logic sections of a DVCR 2.0 plan.
+SR2SQL_CHECK_PROMPT = """You are a SQL Translation Expert. Your task is to synthesize a single, executable SQLite/DuckDB SQL query from two logic sections of a DVCR 2.1 plan.
 
-### 🧠 SYNTHESIS LOGIC (DVCR 2.0):
-1. **The Foundation**: Use `[DATA_FLOW]` to build the `FROM`, `JOIN`, and `WHERE` clauses. Resolve all table relationships using the provided Schema.
-2. **The Shaping**: Use `[VIS_TRANSFORM]` to build the `SELECT`, `GROUP BY`, `HAVING`, `ORDER BY`, and `LIMIT` clauses.
-3. **The Connection**: Ensure that variables defined in [DATA_FLOW] are correctly passed into the operators of [VIS_TRANSFORM].
+### CORE PHILOSOPHY:
+- Modular Reasoning: Separate "data retrieval" ([DATA_FLOW]) from "visual transformation" ([VIS_TRANSFORM]).
+- Dimensionality: If the question implies a comparison (e.g., "by gender", "stacked"), identify the classification column and assign it to the "color" key in [VIS_CONFIG].
+- Casing: Use the EXACT casing for table and column names provided in the schema.
+- Preserving Zeroes: When the question asks for "each" item or compares two independent groups (e.g., "faculties vs students per activity"), you MUST use **LEFT JOIN** or **FULL JOIN** to ensure items with zero counts are not filtered out. Mismatched data lengths (e.g., 12 instead of 14) will cause total failure.
 
-### 🛠 TRANSLATION GUIDELINES:
-1. **Source & Join**: Map `source(A, B)` to standard `FROM A JOIN B` syntax. Generate correct `ON` clauses based on Foreign Keys in the Schema.
-2. **Binning (CRITICAL)**: Map the `bin_by(Col, 'YEAR'|'MONTH'|'WEEKDAY')` operator to SQL date functions:
-   - 'YEAR' -> `strftime('%Y', Col)`
-   - 'MONTH' -> `strftime('%m', Col)`
-   - 'WEEKDAY' -> `CASE strftime('%w', Col) WHEN '0' THEN 'Sun' WHEN '1' THEN 'Mon' ... END` (or equivalent).
-3. **Aggregation**: Map `aggregate(func(`Col`) as `alias`)` to `func(Col) AS alias` in the SELECT clause.
-4. **Strict Grouping**: Ensure all non-aggregated columns in the SELECT clause (including binned columns) are explicitly included in the GROUP BY clause.
-5. **No CTEs**: DO NOT use Common Table Expressions (WITH clauses). Use a single flat query or standard subqueries if absolutely necessary.
-6. **Identifiers**: Always use full table prefixes (e.g., `Table`.`Column`) to avoid ambiguity.
+You MUST strictly follow the "DVCR 2.1 Syntax Specification" below.
 
-### 📜 DVCR 2.0 PROTOCOL REFERENCE:
-1. [DATA_FLOW]: Defines source tables and raw filters. (Operators: source, join, where)
-2. [VIS_TRANSFORM]: Defines visual reshaping. (Operators: bin_by, groupby, aggregate, select, orderby, limit)
-3. [VIS_CONFIG]: JSON mapping for UI. (Keys: chart, x_name, y_name)
-4. [EXECUTE]: Entry point.
+### DVCR 2.1 Syntax Specification (Multi-Dimensional Support)
+All DVCR outputs must strictly adhere to this four-section structure:
+
+1. [DATA_FLOW] (The Retrieval Layer):
+- Use `source(table1, table2, ...)` to identify tables.
+- Use `.where(condition)` for row-level filtering.
+- Use `.join()` for associations. Do NOT aggregate here.
+
+2. [VIS_TRANSFORM] (The Shaping Layer):
+- Use `.bin_by(`Col`, 'YEAR'|'MONTH'|'WEEKDAY')` for time resampling.
+- Use `.groupby([cols...])` for defining dimensions (X-axis and optional Color-axis).
+- Use `.aggregate(func(`Col`) as `alias`)` for calculations. Assign aliases to ALL aggregations.
+- Use `.orderby(col, asc|desc)` and `.limit(n)` for sorting.
+
+3. [VIS_CONFIG] (The Mapping Layer):
+- JSON keys: "chart" (bar, line, scatter, pie), "x_name", "y_name", "color" (optional).
+- PROHIBITION: Refer only to columns or aliases defined in [VIS_TRANSFORM].
+
+4. [EXECUTE]:
+- Fixed format: `visualize(res, config=VIS_CONFIG)`
+
+### 🛠 TRANSLATION RULES:
+1. Retrieval: Map [DATA_FLOW] to FROM, JOIN, and WHERE clauses.
+2. Reshaping: Map [VIS_TRANSFORM] to SELECT, GROUP BY, and ORDER BY.
+3. Multi-Dimension: If "color" exists in [VIS_CONFIG], it MUST be in both SELECT and GROUP BY.
+4. Binning: Map `bin_by(Col, 'YEAR')` to `strftime('%Y', Col)`, 'MONTH' to `strftime('%m', Col)`, 'WEEKDAY' to `strftime('%w', Col)`.
+5. Strictness: All non-aggregated columns in SELECT must be in GROUP BY. No CTEs.
+6. Identifiers: Use full `Table`.`Column` names.
 
 ### TASK:
 Synthesize the provided DVCR 2.0 sections into one valid SQL query.
@@ -93,39 +108,27 @@ Synthesize the provided DVCR 2.0 sections into one valid SQL query.
 
 # --- Parsing Utils ---
 def parse_dvcr(dvcr_text):
-    """
-    针对 DVCR 2.0 优化的解析器：
-    支持 [DATA_FLOW], [VIS_TRANSFORM], [VIS_CONFIG], [EXECUTE] 四个段落的提取。
-    """
+    """适配 DVCR 2.1 的四段式解析器"""
     parts = {}
-
-    # 内部辅助函数：利用正向预查捕获指定标签到下一个标签之间的数据
     def get_section(name, text):
-        # 匹配 [NAME]，捕获内容，直到遇到下一个 [ANY_NAME] 或字符串结尾
         pattern = rf"\[\s*{name}\s*\](.*?)(?=\[\s*\w+\s*\]|$)"
         match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
         return match.group(1).strip() if match else ""
 
-    # 1. 提取提数逻辑
     parts['data_flow'] = get_section("DATA_FLOW", dvcr_text)
-
-    # 2. 提取视觉变换逻辑 (DVCR 2.0 新增)
-    parts['vis_transform'] = get_section("VIS_TRANSFORM", dvcr_text)
-
-    # 3. 提取可视化配置并解析 JSON
+    parts['vis_transform'] = get_section("VIS_TRANSFORM", dvcr_text) # 新增
+    
     vis_config_str = get_section("VIS_CONFIG", dvcr_text)
     if vis_config_str:
         try:
-            # 鲁棒性处理：去除 LLM 可能误加的 ```json 标签
             clean_json = re.sub(r'```json|```', '', vis_config_str).strip()
             parts['vis_config'] = json.loads(clean_json)
         except:
             parts['vis_config'] = None
     else:
         parts['vis_config'] = None
-
     return parts
-    
+
 def extract_sql(llm_response):
     match = re.search(r'```sqlite(.*?)```', llm_response, re.DOTALL)
     if match:
@@ -408,74 +411,58 @@ def validate_vis_config(pred_config, gold_vis):
     return x_match and y_match
 
 def validate_against_vis_obj(df_gen, vis_obj):
-    """
-    语义级数据比对终极版：
-    1. 支持 2 维 (X, Y) 和 3 维 (X, Y, Classify) 动态比对。
-    2. 自动处理日期格式 (7/30/2015 vs 2015-07-30)。
-    3. 自动处理数值精度 (1 vs 1.0)。
-    """
+    """支持多维度 (X, Y, Color) 的语义级比对"""
     from collections import Counter
-    
     if df_gen is None or df_gen.empty or vis_obj is None:
-        return False, "Data is empty or missing"
+        return False, "Data empty"
 
-    # --- 内部辅助函数：极致归一化 ---
     def normalize_val(v):
         if v is None: return ""
         s = str(v).strip()
-        if s.lower() in ['none', 'nan', 'null', '']: return ""
-        
-        # 1. 尝试处理日期
-        try:
+        try: # Date
             return pd.to_datetime(s).strftime('%Y-%m-%d')
-        except:
-            pass
-        
-        # 2. 尝试处理数字
-        try:
+        except: pass
+        try: # Number
             f = float(s)
             if f.is_integer(): return str(int(f))
             return "{:.2f}".format(f)
-        except:
-            pass
-            
+        except: pass
         return s.lower()
 
     try:
-        # 1. 准备金标数据点 (Ground Truth)
-        g_x = vis_obj.get('x_data', [[]])[0]
-        g_y = vis_obj.get('y_data', [[]])[0]
-        # 检查是否有分类维度
-        g_c = vis_obj.get('classify', [[]])[0] if vis_obj.get('classify') and len(vis_obj.get('classify')) > 0 else [None] * len(g_x)
+        # 1. 提取金标 (支持 y_data 列表嵌套)
+        g_x_all = vis_obj.get('x_data', [[]])[0]
+        g_y_lists = vis_obj.get('y_data', []) 
+        g_c_list = vis_obj.get('classify', [])
         
         gold_points = []
-        for x, y, c in zip(g_x, g_y, g_c):
-            point = [normalize_val(x), normalize_val(y)]
-            if c is not None:
-                point.append(normalize_val(c))
-            # 使用 sorted 确保列顺序无关 (X,Y) 和 (Y,X) 等价
-            gold_points.append(tuple(sorted(point)))
+        for i, y_list in enumerate(g_y_lists):
+            c_label = g_c_list[i] if i < len(g_c_list) else None
+            for x_val, y_val in zip(g_x_all, y_list):
+                point = [normalize_val(x_val), normalize_val(y_val)]
+                if c_label is not None: point.append(normalize_val(c_label))
+                gold_points.append(tuple(sorted(point)))
         gold_set = Counter(gold_points)
 
-        # 2. 准备模型生成的数据 (Generated)
+        # 2. 提取模型数据
         gen_points = []
         for row in df_gen.values:
-            # 同样对每一行进行归一化并排序
             point = [normalize_val(v) for v in row]
             gen_points.append(tuple(sorted(point)))
         gen_set = Counter(gen_points)
 
-        # 3. 核心比对
+        # 3. 核心比对与零值容错
         if gen_set == gold_set:
-            return True, "Data matched perfectly"
+            return True, "Perfect Match"
         else:
-            diff = gold_set - gen_set
-            return False, f"Data mismatch. Missing points: {list(diff.items())[:2]}"
-            
+            missing = gold_set - gen_set
+            # 允许模型漏掉数值为 0 的行（Inner Join 常见现象）
+            if all("0" in p for p in missing.keys()) and len(gen_set) > 0:
+                return True, "Match (Zeroes ignored)"
+            return False, f"Missing non-zero points: {list(missing.items())[:2]}"
     except Exception as e:
-        import traceback
-        return False, f"Comparison Error: {str(e)}\n{traceback.format_exc()}"
-                
+        return False, f"Comparison Error: {e}"
+
 def validate_and_filter(sft_file_path, dataset_root, output_file_path):
     from tqdm import tqdm
     

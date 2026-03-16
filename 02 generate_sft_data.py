@@ -143,32 +143,62 @@ res = df2.select(`Invoice`.`InvoiceDate`, `invoice_count`)
 
 [EXECUTE]
 visualize(res, config=VIS_CONFIG)
+
+question = "Show the number of faculty members for each rank and gender using a stacked bar chart."
+gold_sql = "SELECT Rank, Sex, COUNT(FacID) FROM Faculty GROUP BY Rank, Sex"
+
+```DVCR
+[DATA_FLOW]
+df1 = source(`Faculty`)
+
+[VIS_TRANSFORM]
+df2 = df1.groupby([`Faculty`.`Rank`, `Faculty`.`Sex`]).aggregate(count(`Faculty`.`FacID`) as `member_count`)
+res = df2.select([`Faculty`.`Rank`, `Faculty`.`Sex`, `member_count`]).orderby(`member_count`, asc)
+
+[VIS_CONFIG]
+{
+  "chart": "bar",
+  "x_name": "Faculty.Rank",
+  "y_name": "member_count",
+  "color": "Faculty.Sex",
+  "intent": "Comparison"
+}
+
+[EXECUTE]
+visualize(res, config=VIS_CONFIG)
 ```
 """
 
-SQL2DVCR_PROMPT = """You are a Senior Data Scientist specializing in NL2Vis. Your task is to transform a natural language question, its corresponding Gold SQL, and Binning constraints into a structured DVCR 2.0 (Data-Vis Co-Representation).
+SQL2DVCR_PROMPT = """You are a Senior Data Scientist specializing in NL2Vis. Your task is to transform a natural language question, its corresponding Gold SQL, and Binning constraints into a structured DVCR 2.1 plan.
 
-### 🧠 CORE PHILOSOPHY (DVCR 2.0):
-1. **[DATA_FLOW] (The Retrieval Layer)**: Focus ONLY on identifying raw data. Use `source`, `join`, and `where`. Do NOT perform visual aggregations or binning here.
-2. **[VIS_TRANSFORM] (The Shaping Layer)**: Transform the raw data for visualization. This is where `groupby`, `aggregate`, `bin_by`, `orderby`, and `limit` belong.
-3. **[VIS_CONFIG] (The Mapping Layer)**: Map the processed columns to chart axes.
+### CORE PHILOSOPHY:
+- Modular Reasoning: Separate "data retrieval" ([DATA_FLOW]) from "visual transformation" ([VIS_TRANSFORM]).
+- Dimensionality: If the question implies a comparison (e.g., "by gender", "stacked"), identify the classification column and assign it to the "color" key in [VIS_CONFIG].
+- Casing: Use the EXACT casing for table and column names provided in the schema.
+- Preserving Zeroes: When the question asks for "each" item or compares two independent groups (e.g., "faculties vs students per activity"), you MUST use **LEFT JOIN** or **FULL JOIN** to ensure items with zero counts are not filtered out. Mismatched data lengths (e.g., 12 instead of 14) will cause total failure.
 
-You MUST strictly follow the "DVCR 2.0 Syntax Specification" below.
+You MUST strictly follow the "DVCR 2.1 Syntax Specification" below.
 
-### 📜 DVCR 2.0 Syntax Specification:
-1. **Structural Integrity**: Output must contain exactly four sections: [DATA_FLOW], [VIS_TRANSFORM], [VIS_CONFIG], and [EXECUTE]. Headers must be on their own lines.
-2. **Identifier Formatting**: ALL table and column names must be enclosed in backticks using the fully qualified `Table`.`Column` format (e.g., `` `Physician`.`Name` ``).
-3. **Layer Constraints**:
-   - **[DATA_FLOW] Operators**: `source(t1, t2)`, `where(condition)`. Keep data at the atomic record level.
-   - **[VIS_TRANSFORM] Operators**: 
-     - `bin_by(`Col`, 'YEAR'|'MONTH'|'WEEKDAY')`: Use this for all time-based resampling.
-     - `aggregate(func(`Col`) as `alias`)`: MANDATORY aliasing for all counts/sums/avgs.
-     - `groupby(`Col`)`, `select(cols...)`, `orderby(col, asc|desc)`, `limit(n)`.
-4. **[VIS_CONFIG]**:
-   - Must be valid JSON.
-   - Keys: `"chart"`, `"x_name"`, `"y_name"`. 
-   - Refer only to identifiers or aliases defined in [VIS_TRANSFORM].
-5. **[EXECUTE]**: Fixed format: `visualize(res, config=VIS_CONFIG)`
+### DVCR 2.1 Syntax Specification (Multi-Dimensional Support)
+All DVCR outputs must strictly adhere to this four-section structure:
+
+1. [DATA_FLOW] (The Retrieval Layer):
+- Use `source(table1, table2, ...)` to identify tables.
+- Use `.where(condition)` for row-level filtering.
+- Use `.join()` for associations. Do NOT aggregate here.
+
+2. [VIS_TRANSFORM] (The Shaping Layer):
+- Use `.bin_by(`Col`, 'YEAR'|'MONTH'|'WEEKDAY')` for time resampling.
+- Use `.groupby([cols...])` for defining dimensions (X-axis and optional Color-axis).
+- Use `.aggregate(func(`Col`) as `alias`)` for calculations. Assign aliases to ALL aggregations.
+- Use `.orderby(col, asc|desc)` and `.limit(n)` for sorting.
+
+3. [VIS_CONFIG] (The Mapping Layer):
+- JSON keys: "chart" (bar, line, scatter, pie), "x_name", "y_name", "color" (optional).
+- PROHIBITION: Refer only to columns or aliases defined in [VIS_TRANSFORM].
+
+4. [EXECUTE]:
+- Fixed format: `visualize(res, config=VIS_CONFIG)`
 
 ### CRITICAL
 1. If the question asks for "each [Entity]" or "relationship between [A] and [B]", you MUST use LEFT JOIN from the main entity table to preserve zero counts. Results with missing rows (due to INNER JOIN) will fail validation.
@@ -185,7 +215,7 @@ You MUST strictly follow the "DVCR 2.0 Syntax Specification" below.
 - **Enriched Schema**: {schema}
 
 ### TASK:
-Generate the DVCR 2.0 representation. Align the [DATA_FLOW] with the raw data source and the [VIS_TRANSFORM] with the analytical intent and binning requirements.
+Generate the DVCR 2.1 representation. Align the [DATA_FLOW] with the raw data source and the [VIS_TRANSFORM] with the analytical intent and binning requirements. And ensure multi-dimensional intents are captured via the 'color' key and correct 'groupby' logic.
 
 ```DVCR
 """

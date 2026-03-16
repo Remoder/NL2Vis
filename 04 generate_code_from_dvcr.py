@@ -2,7 +2,7 @@ import os
 import sys
 import json
 import pandas as pd
-import re
+import re, keyword
 from openai import OpenAI
 import traceback
 import argparse
@@ -48,63 +48,52 @@ def call_llm(system_prompt, user_prompt, model="gpt-4o"):
 
 # 核心 Prompt：将 DVCR (Data-Vis Co-Representation) 中间表示转换为 Python 代码
 # 这里包含了详细的思维链 (CoT) 和约束条件
-DVCR2PYTHON_PROMPT = """You are an expert of Python Data Visualization. 
-Your task is to convert a "DVCR 2.0" logic plan into executable Python code using `pandas` and `matplotlib`.
+DVCR2PYTHON_PROMPT = """You are an expert Python Data Scientist. 
+Your task is to convert a "DVCR 2.1" logic plan into executable Python code using `pandas`, `matplotlib`.
 
 ## Input Information:
-1. Schema: {schema}
-2. Column Description:
-{column_description}
-3. Question: "{question}"
-4. Relationship: "{relationship}"
-5. DVCR 2.0 (Logic Plan):
+1. **Schema**: {schema}
+2. **Column Description**: {column_description}
+3. **Database Relationships**: {relationship}
+4. **Natural Language Question**: "{question}"
+5. **DVCR 2.1 (Logic Plan)**:
 ```DVCR
 {dvcr}
 ```
 
 ## PANDAS IMPLEMENTATION RULES (MANDATORY):
 
-1. Naming & Bracket Notation:
-ALL DataFrames are pre-processed. Column names are exactly Table.Column (e.g., 'Physician.Name').
+1 .Naming & Bracket Notation:
+ALL DataFrames are pre-processed. Column names are exactly Table.Column.
 MANDATORY: You MUST use bracket notation: df['Table.Column']. Never use dot notation like df.Table.Column.
 
 2. [DATA_FLOW] Implementation (Data Retrieval):
-Joins: Use safe_merge(df1, df2, left_on='...', right_on='...', how='inner').
-Filtering: Use boolean indexing: df = df[df['Table.Col'] == val].
-Cross-Table Logic (CRITICAL): NEVER compare columns from two different DataFrames directly (e.g., df1[df1['A'] == df2['B']]). This causes a "identically-labeled Series" error.
-MANDATORY: You MUST use safe_merge first to join tables, then perform the comparison on the columns of the same merged DataFrame.
+Joins: Use the provided Relationships to identify keys. Use safe_merge(df1, df2, left_on='...', right_on='...', how='inner').
+Cross-Table Logic: NEVER compare columns from two different DataFrames directly. You MUST use safe_merge first to join tables, then perform comparison on the resulting single DataFrame.
 
 3. [VIS_TRANSFORM] Implementation (Data Shaping):
 bin_by(Col, 'YEAR'|'MONTH'|'WEEKDAY'):
 Convert to datetime: df['Col'] = pd.to_datetime(df['Col']).
-Extract:
-'YEAR' -> df['Col'] = df['Col'].dt.year.
-'MONTH' -> df['Col'] = df['Col'].dt.month.
-'WEEKDAY' -> df['Col'] = df['Col'].dt.day_name().str[:3].
-aggregate(...): Use .groupby(...).agg(alias=('Col', 'func')).reset_index().
-orderby(...): Use df = df.sort_values(by='...', ascending=True/False). Ensure this is done BEFORE plotting.
-MANDATORY: ALWAYS call .reset_index() after any groupby to keep columns accessible.
+Extract: 'YEAR' -> .dt.year, 'MONTH' -> .dt.month, 'WEEKDAY' -> .dt.day_name().str[:3].
+Multi-Dimensional Grouping: If the query involves a breakdown (e.g., "by gender"), ensure your .groupby([...]) includes both the X-axis column and the classification (color) column.
+Aggregation: Use .groupby(...).agg(alias=('Col', 'func')).reset_index().
+MANDATORY: ALWAYS call .reset_index() after aggregation to keep columns accessible for plotting.
 
-4. [VIS_CONFIG] Implementation (Final Mapping):
-The final DataFrame MUST contain columns that match the exact strings in VIS_CONFIG['x_name'] and VIS_CONFIG['y_name'].
-Mapping: If you created an alias or renamed a column during transformation, assign it back: df[VIS_CONFIG['x_name']] = df['your_computed_column'].
+4. [VIS_CONFIG] & Visualization (Final Mapping):
+Classification (3D): If VIS_CONFIG contains a "color" key, you MUST pass it to the plotting helper.
+MANDATORY Call Formats:
+Bar Chart: safe_bar_plot(df, x_name=VIS_CONFIG['x_name'], y_name=VIS_CONFIG['y_name'], color_name=VIS_CONFIG.get('color'), title="...")
+Pie Chart: safe_pie_plot(df, x_name=VIS_CONFIG['x_name'], y_name=VIS_CONFIG['y_name'], title="...")
 
 ## ABSOLUTE MANDATORY RULES (FORBIDDEN ACTIONS):
-1. **DO NOT REDEFINE FUNCTIONS**: 
-   - NEVER write `def safe_merge` or `def safe_pie_plot` in your code. They are ALREADY DEFINED in the environment. Redefining them will break the execution.
-2. **USE safe_merge ONLY**: 
-   - NEVER use the pandas method `df.merge()`. 
-   - ALWAYS use the global function `safe_merge(df1, df2, left_on='...', right_on='...', how='inner')`.
-3. **TYPE SAFETY**: 
-   - Our `safe_merge` handles string casting for you. Do not attempt to manually cast IDs to strings.
-4. **NO .values ASSIGNMENT**: 
-   - Never assign columns using `.values`. If you need to join data, use `safe_merge`.
+1. DO NOT REDEFINE FUNCTIONS: NEVER write def safe_merge, def safe_bar_plot, or def safe_pie_plot. They are already defined in the environment.
+2. USE safe_merge ONLY: NEVER use df.merge(). Use the global safe_merge.
+3. NO .values ASSIGNMENT: Never assign columns using .values. Use proper pandas joining or mapping.
 
 ## Execution Requirements:
-No pd.read_csv: DataFrames matching Schema table names are already in the namespace.
-Helper Functions: Use safe_merge, safe_bar_plot(x, y, ...), and safe_pie_plot(x, y, ...).
-Safety: Wrap plotting in if not df.empty:.
-Output: Return ONLY the Python code block inside python ....
+Tables matching Schema names are already loaded as variables.
+Wrap all plotting calls in if not df.empty:.
+Return ONLY the Python code block inside python ....
 """
 
 # ==========================================
@@ -277,27 +266,23 @@ class Coder:
     """
     代码生成器：负责调用 LLM 生成代码，并注入必要的 Header 和 Helper Functions。
     """
-    def gen_code(self, dvcr_text, query, csv_files, db_path, schema_data):
+    def gen_code(self, dvcr_text, query, csv_files, db_path, schema_data):   
         simple_schema = schema_data['simple_schema_list']
         col_desc = schema_data['column_descriptions']
-        relationship = schema_data["relationship"]
 
         user_prompt = DVCR2PYTHON_PROMPT.format(
             schema=simple_schema,
             column_description=col_desc,
             question=query,
-            relationship=relationship,
+            relationship=json.dumps(schema_data['relationship'], indent=2),
             dvcr=dvcr_text
         )
 
-        system_prompt = "You are a Python Visualization Expert. You MUST follow the instructions about JOIN types strictly."
+        system_prompt = "You are a Python Visualization Expert. Use full Table.Column prefixes."
         code_resp = call_llm(system_prompt, user_prompt)
         
         match = re.search(r'```python(.*?)```', code_resp, re.DOTALL)
-        if match:
-            llm_code = match.group(1).strip()
-        else:
-            llm_code = code_resp
+        llm_code = match.group(1).strip() if match else code_resp
 
         # --- 注入代码头部 (Header Injection) ---
         injection_lines = []
@@ -308,6 +293,8 @@ class Coder:
         injection_lines.append("import numpy as np")
         injection_lines.append("import warnings")
         injection_lines.append("warnings.filterwarnings('ignore')")
+        # 【防御】：废掉模型的 plt.show，防止它清空画布导致 05 抓不到图
+        injection_lines.append("plt.show = lambda: None") 
         injection_lines.append("")
         
         injection_lines.append(f"data_dir = '{db_path}'")
@@ -315,76 +302,109 @@ class Coder:
         
         all_tables = [os.path.splitext(os.path.basename(f))[0] for f in csv_files]
 
-        # --- 自动加载数据 (Data Loading Injection) ---
-        # 自动生成读取 CSV 的代码，并进行基础的数据清洗（去空格、类型转换）
+# --- 自动加载数据 ---
         for csv_file in csv_files:
             filename = os.path.basename(csv_file)
             table_name = os.path.splitext(filename)[0]
             
-            injection_lines.append(f"if '{table_name}' not in locals():")
-            injection_lines.append(f"    try:")
-            injection_lines.append(f"        {table_name} = pd.read_csv(os.path.join(data_dir, '{filename}'))")
-            injection_lines.append(f"    except FileNotFoundError:")
-            injection_lines.append(f"        {table_name} = pd.read_csv('{filename}')")
+            # 1. 数据加载逻辑 (保持原样)
+            injection_lines.append(f"if '{table_name}' not in locals() and '{table_name}' not in globals():")
+            injection_lines.append(f"    try: {table_name} = pd.read_csv(os.path.join(data_dir, '{filename}'))")
+            injection_lines.append(f"    except: {table_name} = pd.read_csv('{filename}')")
             
-            # --- 【关键修改】：清洗列名，并强制加上 "表名." 前缀 ---
-            injection_lines.append(f"if not any(str(c).startswith('{table_name}.') for c in {table_name}.columns):")
+            # 2. 列名清洗与重命名 (保持原样)
+            injection_lines.append(f"if not any('.' in str(c) for c in {table_name}.columns):")
             injection_lines.append(f"    {table_name}.columns = [c.strip() for c in {table_name}.columns]")
-            
-            # 尝试修复 ID 类列的类型（转为字符串），注意：此时还没有加前缀
             injection_lines.append(f"    for col in {table_name}.columns:")
             injection_lines.append(f"        if col in {all_tables} or col.endswith('ID') or col.endswith('Code') or col.endswith('SSN') or col == 'Treatment':")
-            injection_lines.append(f"            if {table_name}[col].dtype != 'object':")
-            injection_lines.append(f"                {table_name}[col] = {table_name}[col].astype(str)")
-            
-            # --- 强制重命名为 Table.Column 格式 ---
+            injection_lines.append(f"            if {table_name}[col].dtype != 'object': {table_name}[col] = {table_name}[col].astype(str)")
             injection_lines.append(f"    {table_name}.columns = [f'{table_name}.{{c}}' for c in {table_name}.columns]")
-            injection_lines.append("")
             
-        # --- 注入辅助函数 (Helper Functions Injection) ---
+            # 3. 【合并后的别名映射逻辑】：安全、唯一
+            if table_name[0].isupper():
+                lower_name = table_name.lower()
+                # 检查是否为 Python 关键字
+                if keyword.iskeyword(lower_name):
+                    final_alias = f"{lower_name}_"
+                else:
+                    final_alias = lower_name
+                
+                # 只写一行映射，彻底杜绝 SyntaxError
+                injection_lines.append(f"{final_alias} = {table_name}")
+            
+            injection_lines.append("")
+
+        # --- 注入辅助函数 ---
         injection_lines.append("# --- Helper Functions ---")
-        # safe_merge: 自动处理连接键类型不一致的问题
+        
+        # 1. safe_merge
         injection_lines.append("def safe_merge(df1, df2, left_on=None, right_on=None, on=None, how='inner'):")
-        injection_lines.append("    if on:")
-        injection_lines.append("        left_on = [on] if isinstance(on, str) else on")
-        injection_lines.append("        right_on = [on] if isinstance(on, str) else on")
-        injection_lines.append("    else:")
-        injection_lines.append("        left_on = [left_on] if isinstance(left_on, str) else left_on")
-        injection_lines.append("        right_on = [right_on] if isinstance(right_on, str) else right_on")
-        injection_lines.append("    ")
-        injection_lines.append("    # Force cast to string to prevent int64 vs str merge errors")
-        injection_lines.append("    if left_on:")
-        injection_lines.append("        for k in left_on:")
+        injection_lines.append("    l_on = [on] if on else ([left_on] if isinstance(left_on, str) else left_on)")
+        injection_lines.append("    r_on = [on] if on else ([right_on] if isinstance(right_on, str) else right_on)")
+        injection_lines.append("    if l_on: ")
+        injection_lines.append("        for k in l_on: ")
         injection_lines.append("            if k in df1.columns: df1[k] = df1[k].astype(str)")
-        injection_lines.append("    if right_on:")
-        injection_lines.append("        for k in right_on:")
+        injection_lines.append("    if r_on: ")
+        injection_lines.append("        for k in r_on: ")
         injection_lines.append("            if k in df2.columns: df2[k] = df2[k].astype(str)")
-        injection_lines.append("                ")
-        # 【关键修复】：只传 left_on 和 right_on，绝对不要再传 on=on 进去！
-        injection_lines.append("    return pd.merge(df1, df2, left_on=left_on, right_on=right_on, how=how)")
+        injection_lines.append("    return pd.merge(df1, df2, left_on=l_on, right_on=r_on, how=how, suffixes=('_src', '_tgt'))")
         injection_lines.append("")
         
-        # safe_pie_plot / safe_bar_plot: 封装绘图逻辑，增加判空保护
-        injection_lines.append("def safe_pie_plot(x, y, title=''):")
-        injection_lines.append("    if len(y) > 0 and len(x) == len(y):")
-        injection_lines.append("        plt.figure(figsize=(8, 8))")
-        injection_lines.append("        plt.pie(y, labels=x, autopct='%1.1f%%')")
-        injection_lines.append("        plt.title(title)")
-        injection_lines.append("        plt.savefig('output.png')")
+        # 2. 升级版 safe_bar_plot：内建强制排序与透视
+        injection_lines.append("def safe_bar_plot(df, x_name, y_name, color_name=None, title='', sort_info=None):")
+        injection_lines.append("    fig, ax = plt.subplots(figsize=(10, 6))")
+        injection_lines.append("    if df is None or df.empty:")
+        injection_lines.append("        ax.text(0.5, 0.5, 'Empty Data', ha='center'); plt.savefig('output.png'); return")
+        
+        # A. 智能列名修复
+        injection_lines.append("    def fix_c(c):")
+        injection_lines.append("        if not c or c in df.columns: return c")
+        injection_lines.append("        matched = [col for col in df.columns if col.endswith('.' + c)]")
+        injection_lines.append("        return matched[0] if matched else c")
+        injection_lines.append("    x, y, c = fix_c(x_name), fix_c(y_name), fix_col(color_name) if 'fix_col' in locals() else fix_c(color_name)")
+        
+        # B. DVCR 2.2 视觉意图排序
+        injection_lines.append("    totals = df.groupby(x, observed=False)[y].sum()")
+        injection_lines.append("    if sort_info and sort_info.get('by') == 'y':")
+        injection_lines.append("        is_asc = sort_info.get('order', 'asc').lower() == 'asc'")
+        injection_lines.append("        order = totals.sort_values(ascending=is_asc).index.tolist()")
+        injection_lines.append("    elif sort_info and sort_info.get('by') == 'x':")
+        injection_lines.append("        is_asc = sort_info.get('order', 'asc').lower() == 'asc'")
+        injection_lines.append("        order = totals.sort_index(ascending=is_asc).index.tolist()")
         injection_lines.append("    else:")
-        injection_lines.append("        print('Warning: Data empty or mismatch for pie chart')")
+        injection_lines.append("        order = df[x].drop_duplicates().tolist()")
+        
+        # 将 X 轴锁定为 Categorical，绝对保证后续作图的顺序
+        injection_lines.append("    df[x] = pd.Categorical(df[x], categories=order, ordered=True)")
+        
+        # C. 绘图执行
+        injection_lines.append("    if c and c in df.columns:")
+        injection_lines.append("        pivot_df = df.pivot_table(index=x, columns=c, values=y, aggfunc='sum', observed=False).fillna(0)")
+        injection_lines.append("        pivot_df.sort_index().plot(kind='bar', stacked=True, ax=ax)")
+        injection_lines.append("    else:")
+        injection_lines.append("        plot_df = df.groupby(x, observed=False)[y].sum().sort_index()")
+        injection_lines.append("        plot_df.plot(kind='bar', ax=ax)")
+        
+        # D. 收尾
+        injection_lines.append("    plt.title(title)")
+        injection_lines.append("    plt.xlabel(str(x).split('.')[-1]); plt.ylabel(str(y).split('.')[-1])")
+        injection_lines.append("    plt.xticks(rotation=45); plt.tight_layout()")
+        injection_lines.append("    plt.savefig('output.png')")
         injection_lines.append("")
-        injection_lines.append("def safe_bar_plot(x, y, title='', xlabel='', ylabel=''):")
-        injection_lines.append("    if len(y) > 0 and len(x) == len(y):")
-        injection_lines.append("        plt.figure(figsize=(10, 6))")
-        injection_lines.append("        plt.bar(x, y)")
-        injection_lines.append("        plt.title(title)")
-        injection_lines.append("        plt.xlabel(xlabel)")
-        injection_lines.append("        plt.ylabel(ylabel)")
-        injection_lines.append("        plt.xticks(rotation=45)")
-        injection_lines.append("        plt.savefig('output.png')")
-        injection_lines.append("    else:")
-        injection_lines.append("        print('Warning: Data empty or mismatch for bar chart')")
+
+        # 3. 升级版 safe_pie_plot
+        injection_lines.append("def safe_pie_plot(df, x_name, y_name, title=''):")
+        injection_lines.append("    fig, ax = plt.subplots(figsize=(8, 8))")
+        injection_lines.append("    if df is None or df.empty:")
+        injection_lines.append("        ax.text(0.5, 0.5, 'Empty Data', ha='center'); plt.savefig('output.png'); return")
+        injection_lines.append("    def fix_c(c):")
+        injection_lines.append("        if not c or c in df.columns: return c")
+        injection_lines.append("        matched = [col for col in df.columns if col.endswith('.' + c)]")
+        injection_lines.append("        return matched[0] if matched else c")
+        injection_lines.append("    x, y = fix_c(x_name), fix_c(y_name)")
+        injection_lines.append("    plot_df = df.groupby(x, observed=False)[y].sum()")
+        injection_lines.append("    ax.pie(plot_df, labels=plot_df.index, autopct='%1.1f%%')")
+        injection_lines.append("    plt.title(title); plt.savefig('output.png')")
         injection_lines.append("")
             
         final_code = "\n".join(injection_lines) + "\n" + llm_code
