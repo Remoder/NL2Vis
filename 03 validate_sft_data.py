@@ -9,6 +9,7 @@ from collections import Counter
 from tqdm import tqdm
 from func_timeout import func_timeout, FunctionTimedOut
 from openai import OpenAI
+from dvcr_protocol import build_sr2sql_check_prompt
 
 # --- Configuration ---
 DEFAULT_KEY = "sk-EWwCihmo7aEgCAKZeVV82P3vdQcy6jBg02JBozZ3Ix7Q2ESu"
@@ -41,70 +42,6 @@ def call_llm(user_prompt, system_prompt="You are an expert about text-to-SQL and
             else:
                 print("❌ LLM API permanently failed for this request.")
                 return ""
-
-# --- Prompts ---
-SR2SQL_CHECK_PROMPT = """You are a SQL Translation Expert. Your task is to synthesize a single, executable SQLite/DuckDB SQL query from two logic sections of a DVCR 2.1 plan.
-
-### CORE PHILOSOPHY:
-- Modular Reasoning: Separate "data retrieval" ([DATA_FLOW]) from "visual transformation" ([VIS_TRANSFORM]).
-- Dimensionality: If the question implies a comparison (e.g., "by gender", "stacked"), identify the classification column and assign it to the "color" key in [VIS_CONFIG].
-- Casing: Use the EXACT casing for table and column names provided in the schema.
-- Preserving Zeroes: When the question asks for "each" item or compares two independent groups (e.g., "faculties vs students per activity"), you MUST use **LEFT JOIN** or **FULL JOIN** to ensure items with zero counts are not filtered out. Mismatched data lengths (e.g., 12 instead of 14) will cause total failure.
-
-You MUST strictly follow the "DVCR 2.1 Syntax Specification" below.
-
-### DVCR 2.1 Syntax Specification (Multi-Dimensional Support)
-All DVCR outputs must strictly adhere to this four-section structure:
-
-1. [DATA_FLOW] (The Retrieval Layer):
-- Use `source(table1, table2, ...)` to identify tables.
-- Use `.where(condition)` for row-level filtering.
-- Use `.join()` for associations. Do NOT aggregate here.
-
-2. [VIS_TRANSFORM] (The Shaping Layer):
-- Use `.bin_by(`Col`, 'YEAR'|'MONTH'|'WEEKDAY')` for time resampling.
-- Use `.groupby([cols...])` for defining dimensions (X-axis and optional Color-axis).
-- Use `.aggregate(func(`Col`) as `alias`)` for calculations. Assign aliases to ALL aggregations.
-- Use `.orderby(col, asc|desc)` and `.limit(n)` for sorting.
-
-3. [VIS_CONFIG] (The Mapping Layer):
-- JSON keys: "chart" (bar, line, scatter, pie), "x_name", "y_name", "color" (optional).
-- PROHIBITION: Refer only to columns or aliases defined in [VIS_TRANSFORM].
-
-4. [EXECUTE]:
-- Fixed format: `visualize(res, config=VIS_CONFIG)`
-
-### 🛠 TRANSLATION RULES:
-1. Retrieval: Map [DATA_FLOW] to FROM, JOIN, and WHERE clauses.
-2. Reshaping: Map [VIS_TRANSFORM] to SELECT, GROUP BY, and ORDER BY.
-3. Multi-Dimension: If "color" exists in [VIS_CONFIG], it MUST be in both SELECT and GROUP BY.
-4. Binning: Map `bin_by(Col, 'YEAR')` to `strftime('%Y', Col)`, 'MONTH' to `strftime('%m', Col)`, 'WEEKDAY' to `strftime('%w', Col)`.
-5. Strictness: All non-aggregated columns in SELECT must be in GROUP BY. No CTEs.
-6. Identifiers: Use full `Table`.`Column` names.
-
-### TASK:
-Synthesize the provided DVCR 2.0 sections into one valid SQL query.
-
-### CONTEXT:
-- **Question**: "{question}"
-- **Target Visualization**: {vis_config}
-- **Database Schema**: {schema}
-
-### INPUT DVCR SECTIONS:
-**[DATA_FLOW]**: 
-{data_flow}
-
-**[VIS_TRANSFORM]**: 
-{vis_transform}
-
-### INSTRUCTIONS:
-1. Use the "Target Visualization" and "VIS_TRANSFORM" to determine the final SELECT projections.
-2. Maintain the aliases defined in `aggregate(... as alias)`.
-3. Ensure there is a SPACE after the SELECT keyword.
-4. Reference columns exactly as defined in the DVCR (using backticks if provided).
-
-```sqlite
-"""
 
 # --- Parsing Utils ---
 def parse_dvcr(dvcr_text):
@@ -268,14 +205,144 @@ def execute_query_compatible(con, sql_str, max_retries=3):
             
     return None, "Max auto-fix retries exceeded", current_sql
 
-def fix_sql_quotes(sql_str):
+def sanitize_sql_literals(sql_str):
     """
-    将 Gold SQL 中误用的双引号替换为单引号，
-    防止 DuckDB 将其误认为列名。
+    统一 SQL 中的字符串常量，避免 LLM 产出的双引号触发 DuckDB Binder 报错。
     """
-    # 简单的启发式逻辑：如果双引号内是值（如 "Lisa", "food"），转为单引号
-    # 这里我们只对常见的比较操作符后的双引号进行替换
-    return re.sub(r'=\s*"([^"]+)"', r"= '\1'", sql_str)
+    if not sql_str:
+        return sql_str
+
+    sql_str = re.sub(r'=\s*"([^"]+)"', r"= '\1'", sql_str)
+    sql_str = re.sub(
+        r'IN\s*\(([^)]+)\)',
+        lambda m: m.group(0).replace('"', "'"),
+        sql_str,
+        flags=re.IGNORECASE,
+    )
+    return sql_str
+
+
+WEEKDAY_LABELS = [
+    ('0', 'sun'),
+    ('1', 'mon'),
+    ('2', 'tue'),
+    ('3', 'wed'),
+    ('4', 'thur'),
+    ('5', 'fri'),
+    ('6', 'sat'),
+]
+
+
+def _find_matching_parenthesis(sql_str, start_idx):
+    depth = 0
+    in_single = False
+    in_double = False
+    escape = False
+
+    for idx in range(start_idx, len(sql_str)):
+        ch = sql_str[idx]
+        if ch == '\\' and not escape:
+            escape = True
+            continue
+        if ch == "'" and not in_double and not escape:
+            in_single = not in_single
+        elif ch == '"' and not in_single and not escape:
+            in_double = not in_double
+        elif ch == '(' and not in_single and not in_double:
+            depth += 1
+        elif ch == ')' and not in_single and not in_double:
+            depth -= 1
+            if depth == 0:
+                return idx
+        if escape:
+            escape = False
+    return -1
+
+
+def _split_first_argument(segment):
+    depth = 0
+    in_single = False
+    in_double = False
+    escape = False
+
+    for idx, ch in enumerate(segment):
+        if ch == '\\' and not escape:
+            escape = True
+            continue
+        if ch == "'" and not in_double and not escape:
+            in_single = not in_single
+        elif ch == '"' and not in_single and not escape:
+            in_double = not in_double
+        elif ch == '(' and not in_single and not in_double:
+            depth += 1
+        elif ch == ')' and not in_single and not in_double:
+            depth = max(depth - 1, 0)
+        elif ch == ',' and depth == 0 and not in_single and not in_double:
+            return segment[:idx], segment[idx + 1 :]
+        if escape:
+            escape = False
+    return None, None
+
+
+def coerce_weekday_labels(sql_str):
+    """
+    将 strftime('%w', ...) 包装成固定的 weekday 文本，避免数值 weekday 与金标不一致。
+    """
+    if not sql_str:
+        return sql_str
+
+    lower_sql = sql_str.lower()
+    idx = 0
+    pieces = []
+
+    while idx < len(sql_str):
+        pos = lower_sql.find("strftime", idx)
+        if pos == -1:
+            pieces.append(sql_str[idx:])
+            break
+
+        name_end = pos + len("strftime")
+        lookahead = name_end
+        while lookahead < len(sql_str) and sql_str[lookahead].isspace():
+            lookahead += 1
+        if lookahead >= len(sql_str) or sql_str[lookahead] != '(':
+            pieces.append(sql_str[idx:pos + 1])
+            idx = pos + 1
+            continue
+
+        paren_start = lookahead
+        paren_end = _find_matching_parenthesis(sql_str, paren_start)
+        if paren_end == -1:
+            pieces.append(sql_str[idx:pos + 1])
+            idx = pos + 1
+            continue
+
+        inner = sql_str[paren_start + 1 : paren_end]
+        arg1, arg_rest = _split_first_argument(inner)
+        if arg1 is None or arg_rest is None:
+            pieces.append(sql_str[idx:pos + 1])
+            idx = pos + 1
+            continue
+
+        first_arg = arg1.strip().strip('"').strip("'").lower()
+        if first_arg != '%w':
+            pieces.append(sql_str[idx:pos + 1])
+            idx = pos + 1
+            continue
+
+        original_call = sql_str[pos : paren_end + 1]
+        case_expr = ["(CASE ", original_call, " "]
+        for digit, label in WEEKDAY_LABELS:
+            case_expr.append(f"WHEN '{digit}' THEN '{label}' ")
+        case_expr.append("ELSE ")
+        case_expr.append(original_call)
+        case_expr.append(" END)")
+
+        pieces.append(sql_str[idx:pos])
+        pieces.append(''.join(case_expr))
+        idx = paren_end + 1
+
+    return ''.join(pieces)
 
 def execute_with_timeout(gen_sql, gold_sql, db_path):
     """独立执行对比，修复之前的幽灵报错 bug"""
@@ -283,8 +350,9 @@ def execute_with_timeout(gen_sql, gold_sql, db_path):
     # 1. 获取（或创建）缓存的数据库连接
     con = get_duckdb_connection(db_path)
     
-    # 1.5. 修改 Gold_sql 中的双引号问题
-    gold_sql = fix_sql_quotes(gold_sql)
+    # 1.5. 标准化 SQL 字符串常量 & weekday 表达式
+    gen_sql = coerce_weekday_labels(sanitize_sql_literals(gen_sql))
+    gold_sql = coerce_weekday_labels(sanitize_sql_literals(gold_sql))
 
     # 2. 隔离执行 Gen SQL 和 Gold SQL
     df_gen, gen_err, final_gen_sql = execute_query_compatible(con, gen_sql)
@@ -410,56 +478,99 @@ def validate_vis_config(pred_config, gold_vis):
 
     return x_match and y_match
 
+def normalize_val(v, is_x_axis=False, gold_samples=None):
+    """
+    增强版归一化：
+    1. 保护数字/比分不被误转为日期。
+    2. 自动处理 DuckDB 的 strftime('%w') 数字到英文周几的转换。
+    """
+    if v is None or pd.isna(v): return ""
+    s = str(v).strip()
+
+    # --- [核心修复] 统一各种横杠和连接符 ---
+    # 替换 En-dash (–), Em-dash (—), Figure dash (‒) 为标准 Hyphen (-)
+    s = str(v).strip().replace('–', '-').replace('—', '-').replace('‒', '-')
+    
+    # --- 1. 星期几数字映射 (解决 Apartment_Rentals 问题) ---
+    # 如果是 X 轴，且产出是单位数字 '0'-'6'，且金标里有 ['Mon', 'Tue'...] 缩写
+    weekday_num_to_str = {
+        '0': 'sun', '1': 'mon', '2': 'tue', '3': 'wed', 
+        '4': 'thur', '5': 'fri', '6': 'sat'
+    }
+    if is_x_axis and s in weekday_num_to_str:
+        # 检查金标样本，确定是否需要映射
+        if gold_samples and any(day in [str(gs).lower() for gs in gold_samples] for day in weekday_num_to_str.values()):
+            return weekday_num_to_str[s]
+
+    # --- 2. 保护逻辑：拦截纯数字和比分格式，防止 pd.to_datetime 误判 (解决 Basketball 问题) ---
+    # 规则：如果是纯数字 (如 2100) 或者符合 "数字-数字" (如 102-98) 且不包含斜杠或冒号
+    is_pure_num = re.match(r'^-?\d+(\.\d+)?$', s)
+    is_score_format = re.match(r'^\d+[\-–]\d+$', s) # 处理 Hyphen 和 En-dash
+    
+    if not is_pure_num and not is_score_format:
+        try:
+            # 只有在包含常见日期分隔符时才尝试转日期
+            if any(sep in s for sep in ['/', '-', '.']) or len(s) > 6:
+                return pd.to_datetime(s).strftime('%Y-%m-%d')
+        except:
+            pass
+
+    # --- 3. 数字精度处理 (2100.0 -> 2100) ---
+    try:
+        f = float(s)
+        if f.is_integer(): return str(int(f))
+        return "{:.2f}".format(f)
+    except:
+        pass
+
+    return s.lower()
+
 def validate_against_vis_obj(df_gen, vis_obj):
-    """支持多维度 (X, Y, Color) 的语义级比对"""
-    from collections import Counter
+    """
+    更新后的比对函数，传入 X 轴金标样本以支持上下文感知的归一化
+    """
     if df_gen is None or df_gen.empty or vis_obj is None:
         return False, "Data empty"
 
-    def normalize_val(v):
-        if v is None: return ""
-        s = str(v).strip()
-        try: # Date
-            return pd.to_datetime(s).strftime('%Y-%m-%d')
-        except: pass
-        try: # Number
-            f = float(s)
-            if f.is_integer(): return str(int(f))
-            return "{:.2f}".format(f)
-        except: pass
-        return s.lower()
-
     try:
-        # 1. 提取金标 (支持 y_data 列表嵌套)
+        # 1. 获取金标数据
         g_x_all = vis_obj.get('x_data', [[]])[0]
-        g_y_lists = vis_obj.get('y_data', []) 
+        g_y_lists = vis_obj.get('y_data', [])
         g_c_list = vis_obj.get('classify', [])
         
+        # 提取金标 X 轴样本用于 normalize_val 的上下文判断
+        gold_x_samples = set([str(x).lower() for x in g_x_all])
+
         gold_points = []
         for i, y_list in enumerate(g_y_lists):
             c_label = g_c_list[i] if i < len(g_c_list) else None
             for x_val, y_val in zip(g_x_all, y_list):
+                # 金标已经是最终结果，简单归一化即可
                 point = [normalize_val(x_val), normalize_val(y_val)]
                 if c_label is not None: point.append(normalize_val(c_label))
                 gold_points.append(tuple(sorted(point)))
         gold_set = Counter(gold_points)
 
-        # 2. 提取模型数据
+        # 2. 提取模型生成的数据
         gen_points = []
+        # 假设 df_gen 的第一列是 X 轴，第二列是 Y 轴
         for row in df_gen.values:
-            point = [normalize_val(v) for v in row]
-            gen_points.append(tuple(sorted(point)))
+            # 第一列传 is_x_axis=True，并带入金标样本作为参考
+            p_list = []
+            for idx, v in enumerate(row):
+                is_x = (idx == 0)
+                p_list.append(normalize_val(v, is_x_axis=is_x, gold_samples=gold_x_samples))
+            gen_points.append(tuple(sorted(p_list)))
         gen_set = Counter(gen_points)
 
-        # 3. 核心比对与零值容错
+        # 3. 比对逻辑（保持不变）
         if gen_set == gold_set:
             return True, "Perfect Match"
         else:
             missing = gold_set - gen_set
-            # 允许模型漏掉数值为 0 的行（Inner Join 常见现象）
-            if all("0" in p for p in missing.keys()) and len(gen_set) > 0:
+            if all("0" in str(p) for p in missing.keys()) and len(gen_set) > 0:
                 return True, "Match (Zeroes ignored)"
-            return False, f"Missing non-zero points: {list(missing.items())[:2]}"
+            return False, f"Missing points count: {len(missing)}. Example: {list(missing.items())[:1]}"
     except Exception as e:
         return False, f"Comparison Error: {e}"
 
@@ -536,11 +647,28 @@ def validate_and_filter(sft_file_path, dataset_root, output_file_path):
                 con = get_duckdb_connection(db_path)
                 
                 # 转换并执行
-                prompt = SR2SQL_CHECK_PROMPT.format(
-                    schema=schema_str, question=question, data_flow=data_flow, vis_transform=vis_transform, vis_config=json.dumps(vis_config)
+                prompt = build_sr2sql_check_prompt(
+                    schema=schema_str,
+                    question=question,
+                    data_flow=data_flow,
+                    vis_transform=vis_transform,
+                    vis_config=json.dumps(vis_config),
                 )
                 gen_sql_resp = call_llm(prompt)
-                gen_sql = extract_sql(gen_sql_resp)
+                gen_sql_raw = extract_sql(gen_sql_resp)
+                gen_sql_fixed = coerce_weekday_labels(sanitize_sql_literals(gen_sql_raw))
+
+                # 若 SQL 被修复，尝试同步写回 DVCR
+                if gen_sql_fixed != gen_sql_raw:
+                    replaced = False
+                    if gen_sql_raw and gen_sql_raw in dvcr_output:
+                        dvcr_output = dvcr_output.replace(gen_sql_raw, gen_sql_fixed, 1)
+                        replaced = True
+                    gen_sql = gen_sql_fixed
+                    if replaced:
+                        item['output'] = dvcr_output
+                else:
+                    gen_sql = gen_sql_raw
                 
                 df_gen, gen_err, _ = execute_query_compatible(con, gen_sql)
                 
