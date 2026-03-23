@@ -59,99 +59,138 @@ def run_command(command, description, log_file):
 
 def main():
     parser = argparse.ArgumentParser(description="NL2Vis 全流程自动执行 Pipeline (带日志记录版)")
-    parser.add_argument("--db_id", type=str, required=True, help="数据库 ID (例如: hospital_1)")
+    parser.add_argument(
+        "--db_id",
+        type=str,
+        nargs="+",
+        required=True,
+        help="数据库 ID，可传多个（空格分隔或逗号分隔），例如: --db_id hospital_1 activity_1 或 --db_id hospital_1,activity_1",
+    )
     parser.add_argument("--project_root", type=str, default="/home/wys/data/expriments/NL2Vis", help="项目根目录")
     args = parser.parse_args()
 
-    db_id = args.db_id
+    # 兼容两种输入形式：
+    # 1) --db_id a b c
+    # 2) --db_id a,b,c
+    raw_db_ids = args.db_id
+    db_ids = []
+    for token in raw_db_ids:
+        for part in token.split(","):
+            db = part.strip()
+            if db:
+                db_ids.append(db)
+
+    # 去重但保留顺序
+    seen = set()
+    db_ids = [x for x in db_ids if not (x in seen or seen.add(x))]
+
+    if not db_ids:
+        print("❌ 未解析到有效的 db_id，请检查 --db_id 参数。")
+        sys.exit(2)
+
     root = args.project_root
-    
+
     # 定义各项路径
     scripts_dir = os.path.join(root, "codes")
     code_folder = os.path.join(root, "temp_results/generated_code/")
     benchmark_path = os.path.join(root, "dataset/")
-    
-    # 日志目录与文件
-    log_dir = os.path.join(root, "logs", f"logs_static_eval_{db_id}")
-    os.makedirs(log_dir, exist_ok=True)
-    all_log_file = os.path.join(log_dir, "all_log.txt")
-    
-    # 预检：Stage 01 的输出文件
-    schema_file_path = os.path.join(root, "temp_results", "schema", f"{db_id}.json")
 
     python_bin = sys.executable
+    overall_start = time.time()
 
-    # 初始化日志文件 (如果是新运行，可以选 'w' 清空，这里建议用 'a' 并在头部加分割)
-    with open(all_log_file, "a", encoding="utf-8") as f:
-        f.write(f"\n\n{'#'*80}\n")
-        f.write(f"🚀 NEW PIPELINE RUN | DB_ID: {db_id} | TIME: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"{'#'*80}\n")
+    print(f"\n🚀 启动流水线 | Target DBs: {', '.join(db_ids)}")
 
-    print(f"\n🚀 启动流水线 | Target DB: {db_id}")
-    print(f"📄 日志文件: {all_log_file}")
-    
-    pipeline_start = time.time()
-    pipeline_steps = []
+    for db_index, db_id in enumerate(db_ids, start=1):
+        # 日志目录与文件
+        log_dir = os.path.join(root, "logs", f"logs_static_eval_{db_id}")
+        os.makedirs(log_dir, exist_ok=True)
+        all_log_file = os.path.join(log_dir, "all_log.txt")
 
-    # ---------------------------------------------------------
-    # 逻辑 1: 检查 Schema 是否存在
-    # ---------------------------------------------------------
-    if os.path.exists(schema_file_path):
-        skip_msg = f"⏭️  [跳过] Stage 1: 检测到 Schema 增强文件已存在 ({schema_file_path})\n"
-        print(skip_msg)
+        # 预检：Stage 01 的输出文件
+        schema_file_path = os.path.join(root, "temp_results", "schema", f"{db_id}.json")
+
+        # 初始化日志文件 (append)
         with open(all_log_file, "a", encoding="utf-8") as f:
-            f.write(skip_msg)
-    else:
-        pipeline_steps.append({
-            "desc": "Stage 1: Schema Discovery",
-            "command": [python_bin, os.path.join(scripts_dir, "01 schema_discovery_agent222.py"), "--db_id", db_id]
-        })
+            f.write(f"\n\n{'#'*80}\n")
+            f.write(f"🚀 NEW PIPELINE RUN | DB_ID: {db_id} | TIME: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"{'#'*80}\n")
 
-    # ---------------------------------------------------------
-    # 添加后续阶段
-    # ---------------------------------------------------------
-    pipeline_steps.extend([
-        {
-            "desc": "Stage 2: SFT Data Generation",
-            "command": [python_bin, os.path.join(scripts_dir, "02 generate_sft_data.py"), "--db_id", db_id]
-        },
-        {
-            "desc": "Stage 3: SFT Data Validation",
-            "command": [python_bin, os.path.join(scripts_dir, "03 validate_sft_data.py"), "--db_id", db_id]
-        },
-        {
-            "desc": "Stage 4: Python Code Generation",
-            "command": [python_bin, os.path.join(scripts_dir, "04 generate_code_from_dvcr.py"), "--db_id", db_id]
-        },
-        {
-            "desc": "Stage 5: Static Code Evaluation",
-            "command": [
-                python_bin, 
-                os.path.join(scripts_dir, "05 evaluate_static_code_py.py"), 
-                "--code_folder", code_folder,
-                "--benchmark", benchmark_path,
-                "--db_id", db_id
-            ]
-        }
-    ])
+        print(f"\n[{db_index}/{len(db_ids)}] 🎯 Target DB: {db_id}")
+        print(f"📄 日志文件: {all_log_file}")
 
-    # ---------------------------------------------------------
-    # 执行
-    # ---------------------------------------------------------
-    for step in pipeline_steps:
-        success = run_command(step["command"], step["desc"], all_log_file)
-        if not success:
-            fail_msg = f"\n🛑 流水线在 [{step['desc']}] 异常中断。\n"
-            print(fail_msg)
+        pipeline_start = time.time()
+        pipeline_steps = []
+
+        # ---------------------------------------------------------
+        # 逻辑 1: 检查 Schema 是否存在
+        # ---------------------------------------------------------
+        if os.path.exists(schema_file_path):
+            skip_msg = f"⏭️  [跳过] Stage 1: 检测到 Schema 增强文件已存在 ({schema_file_path})\n"
+            print(skip_msg)
             with open(all_log_file, "a", encoding="utf-8") as f:
-                f.write(fail_msg)
-            sys.exit(1)
+                f.write(skip_msg)
+        else:
+            pipeline_steps.append(
+                {
+                    "desc": "Stage 1: Schema Discovery",
+                    "command": [python_bin, os.path.join(scripts_dir, "01 schema_discovery_agent222.py"), "--db_id", db_id],
+                }
+            )
 
-    pipeline_total_time = (time.time() - pipeline_start) / 60
-    final_msg = f"\n🎉 所有阶段执行成功！\n🎯 Target DB: {db_id}\n⏱️ 总运行时间: {pipeline_total_time:.2f} 分钟\n"
-    print(final_msg)
-    with open(all_log_file, "a", encoding="utf-8") as f:
-        f.write(final_msg)
+        # ---------------------------------------------------------
+        # 添加后续阶段
+        # ---------------------------------------------------------
+        pipeline_steps.extend(
+            [
+                {
+                    "desc": "Stage 2: SFT Data Generation",
+                    "command": [python_bin, os.path.join(scripts_dir, "02 generate_sft_data.py"), "--db_id", db_id],
+                },
+                {
+                    "desc": "Stage 3: SFT Data Validation",
+                    "command": [python_bin, os.path.join(scripts_dir, "03 validate_sft_data.py"), "--db_id", db_id],
+                },
+                {
+                    "desc": "Stage 4: Python Code Generation",
+                    "command": [python_bin, os.path.join(scripts_dir, "04 generate_code_from_dvcr.py"), "--db_id", db_id],
+                },
+                {
+                    "desc": "Stage 5: Static Code Evaluation",
+                    "command": [
+                        python_bin,
+                        os.path.join(scripts_dir, "05 evaluate_static_code_py.py"),
+                        "--code_folder",
+                        code_folder,
+                        "--benchmark",
+                        benchmark_path,
+                        "--db_id",
+                        db_id,
+                    ],
+                },
+            ]
+        )
+
+        # ---------------------------------------------------------
+        # 执行
+        # ---------------------------------------------------------
+        for step in pipeline_steps:
+            success = run_command(step["command"], f"[{db_id}] {step['desc']}", all_log_file)
+            if not success:
+                fail_msg = f"\n🛑 流水线在 [{step['desc']}] 异常中断。DB: {db_id}\n"
+                print(fail_msg)
+                with open(all_log_file, "a", encoding="utf-8") as f:
+                    f.write(fail_msg)
+                sys.exit(1)
+
+        pipeline_total_time = (time.time() - pipeline_start) / 60
+        final_msg = f"\n🎉 当前数据库执行成功！\n🎯 Target DB: {db_id}\n⏱️ 本库运行时间: {pipeline_total_time:.2f} 分钟\n"
+        print(final_msg)
+        with open(all_log_file, "a", encoding="utf-8") as f:
+            f.write(final_msg)
+
+    overall_minutes = (time.time() - overall_start) / 60
+    print(f"\n✅ 全部数据库执行完成: {', '.join(db_ids)}")
+    print(f"⏱️ 总运行时间: {overall_minutes:.2f} 分钟")
 
 if __name__ == "__main__":
     main()
