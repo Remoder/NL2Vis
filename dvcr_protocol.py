@@ -14,7 +14,7 @@ DVCR_PROTOCOL_SYSTEM_PROMPT = (
 
 DVCR_CORE_PHILOSOPHY = """### CORE PHILOSOPHY:
 - Modular Reasoning: Separate "data retrieval" ([DATA_FLOW]) from "visual transformation" ([VIS_TRANSFORM]).
-- Dimensionality: If the question implies a comparison (e.g., "by gender", "stacked"), identify the classification column and assign it to the "color" key in [VIS_CONFIG].
+- Dimensionality: If the question implies a comparison (e.g., "by gender", "stacked", "multi-series"), identify the classification column and assign it to "classify" in [VIS_CONFIG]. "color" is an optional rendering channel and may mirror "classify" for compatibility.
 - Casing: Use the EXACT casing for table and column names provided in the schema.
 - Preserving Zeroes: When the question asks for "each" item or compares two independent groups (e.g., "faculties vs students per activity"), you MUST use **LEFT JOIN** or **FULL JOIN** to ensure items with zero counts are not filtered out. Mismatched data lengths (e.g., 12 instead of 14) will cause total failure.
 """
@@ -35,7 +35,21 @@ All DVCR outputs must strictly adhere to this four-section structure:
 - Use `.orderby(col, asc|desc)` and `.limit(n)` for sorting.
 
 3. [VIS_CONFIG] (The Mapping Layer):
-- JSON keys: "chart" (bar, line, scatter, pie), "x_name", "y_name", "color" (optional).
+- JSON keys:
+  - Required baseline: "chart" (bar, line, scatter, pie), "x_name", "y_name".
+  - Semantic grouping key: "classify" (required for grouped/stacked/multi-series scenarios).
+  - Optional rendering key: "color" (if omitted, it can inherit from "classify").
+  - Chart modes: "scatter_mode" (plain|grouped), "bar_mode" (plain|grouped|stacked), "line_mode" (single|multi_series).
+  - Optional sorting key: "sort_info" (object), e.g. {"by":"x|y","order":"asc|desc"}.
+- Compatibility rules:
+  - If only "color" exists, treat "classify" = "color".
+  - If only "classify" exists, "color" may be derived at execution time.
+  - Mode defaults: scatter->plain, bar->plain, line->single.
+- Constraint rules:
+  - scatter_mode=grouped => classify is required and VIS_TRANSFORM should include x, y, classify.
+  - bar_mode in {grouped, stacked} => classify is required; aggregated queries should group by x and classify.
+  - line_mode=multi_series => classify is required and VIS_TRANSFORM should include x, y, classify.
+  - If [VIS_TRANSFORM] includes orderby/sort intent, VIS_CONFIG.sort_info should be provided and consistent with axis + direction.
 - PROHIBITION: Refer only to columns or aliases defined in [VIS_TRANSFORM].
 
 4. [EXECUTE]:
@@ -63,6 +77,7 @@ res = df2.select(`Faculty`.`Rank`, `member_count`)
   "chart": "bar",
   "x_name": "Faculty.Rank",
   "y_name": "member_count",
+  "bar_mode": "plain",
   "intent": "Comparison"
 }
 
@@ -87,6 +102,7 @@ res = df1.select(`Student`.`Age`, `Student`.`GPA`)
   "chart": "scatter",
   "x_name": "Student.Age",
   "y_name": "Student.GPA",
+  "scatter_mode": "plain",
   "intent": "Correlation"
 }
 
@@ -115,6 +131,8 @@ res = df2.select(`schools`.`School Name`, `free_rate`)
   "chart": "bar",
   "x_name": "School Name",
   "y_name": "free_rate",
+  "bar_mode": "plain",
+  "sort_info": {"by": "y", "order": "desc"},
   "intent": "Rank"
 }
 
@@ -141,11 +159,13 @@ res = df2.select(`Invoice`.`InvoiceDate`, `invoice_count`)
   "chart": "line",
   "x_name": "Invoice.InvoiceDate",
   "y_name": "invoice_count",
+  "line_mode": "single",
   "intent": "Trend"
 }
 
 [EXECUTE]
 visualize(res, config=VIS_CONFIG)
+```
 
 question = "Show the number of faculty members for each rank and gender using a stacked bar chart."
 gold_sql = "SELECT Rank, Sex, COUNT(FacID) FROM Faculty GROUP BY Rank, Sex"
@@ -163,8 +183,62 @@ res = df2.select([`Faculty`.`Rank`, `Faculty`.`Sex`, `member_count`]).orderby(`m
   "chart": "bar",
   "x_name": "Faculty.Rank",
   "y_name": "member_count",
+  "classify": "Faculty.Sex",
+  "bar_mode": "stacked",
+  "sort_info": {"by": "y", "order": "asc"},
   "color": "Faculty.Sex",
   "intent": "Comparison"
+}
+
+[EXECUTE]
+visualize(res, config=VIS_CONFIG)
+```
+
+question = "Show a grouped scatter plot of age vs GPA by gender."
+gold_sql = "SELECT Age, GPA, Sex FROM Student"
+
+```DVCR
+[DATA_FLOW]
+df1 = source(`Student`)
+
+[VIS_TRANSFORM]
+res = df1.select(`Student`.`Age`, `Student`.`GPA`, `Student`.`Sex`)
+
+[VIS_CONFIG]
+{
+  "chart": "scatter",
+  "x_name": "Student.Age",
+  "y_name": "Student.GPA",
+  "classify": "Student.Sex",
+  "scatter_mode": "grouped",
+  "color": "Student.Sex",
+  "intent": "Correlation"
+}
+
+[EXECUTE]
+visualize(res, config=VIS_CONFIG)
+```
+
+question = "Plot yearly invoice totals by billing country as a multi-series line chart."
+gold_sql = "SELECT strftime('%Y', InvoiceDate) AS year, BillingCountry, COUNT(InvoiceId) AS invoice_count FROM Invoice GROUP BY year, BillingCountry ORDER BY year"
+
+```DVCR
+[DATA_FLOW]
+df1 = source(`Invoice`)
+
+[VIS_TRANSFORM]
+df2 = df1.bin_by(`Invoice`.`InvoiceDate`, 'YEAR').groupby([`Invoice`.`InvoiceDate`, `Invoice`.`BillingCountry`]).aggregate(count(`Invoice`.`InvoiceId`) as `invoice_count`)
+res = df2.select(`Invoice`.`InvoiceDate`, `Invoice`.`BillingCountry`, `invoice_count`).orderby(`Invoice`.`InvoiceDate`, asc)
+
+[VIS_CONFIG]
+{
+  "chart": "line",
+  "x_name": "Invoice.InvoiceDate",
+  "y_name": "invoice_count",
+  "classify": "Invoice.BillingCountry",
+  "line_mode": "multi_series",
+  "color": "Invoice.BillingCountry",
+  "intent": "Trend"
 }
 
 [EXECUTE]
@@ -197,7 +271,7 @@ You MUST strictly follow the "DVCR 2.1 Syntax Specification" below.
 - **Enriched Schema**: {schema}
 
 ### TASK:
-Generate the DVCR 2.1 representation. Align the [DATA_FLOW] with the raw data source and the [VIS_TRANSFORM] with the analytical intent and binning requirements. And ensure multi-dimensional intents are captured via the 'color' key and correct 'groupby' logic.
+Generate the DVCR 2.1 representation. Align the [DATA_FLOW] with the raw data source and the [VIS_TRANSFORM] with the analytical intent and binning requirements. Ensure multi-dimensional intents are captured via "classify" and the correct *_mode key (scatter_mode/bar_mode/line_mode). "color" is optional and may mirror "classify" for rendering compatibility. If ordering is intended (e.g., SQL ORDER BY or VIS_TRANSFORM orderby/sort_values), explicitly provide VIS_CONFIG.sort_info and keep its axis + direction consistent with the transform.
 
 ```DVCR
 """.format(
@@ -224,10 +298,11 @@ You MUST strictly follow the "DVCR 2.1 Syntax Specification" below.
 ### 🛠 TRANSLATION RULES:
 1. Retrieval: Map [DATA_FLOW] to FROM, JOIN, and WHERE clauses.
 2. Reshaping: Map [VIS_TRANSFORM] to SELECT, GROUP BY, and ORDER BY.
-3. Multi-Dimension: If "color" exists in [VIS_CONFIG], it MUST be in both SELECT and GROUP BY.
+3. Multi-Dimension: Use "classify" as the primary series key (fallback to "color" if classify is missing). If aggregation is present and a series key exists, include that key in both SELECT and GROUP BY. For non-aggregated scatter, include the series key in SELECT without forcing GROUP BY.
 4. Binning: Map `bin_by(Col, 'YEAR')` to `strftime('%Y', Col)`, 'MONTH' to `strftime('%m', Col)`, 'WEEKDAY' to `strftime('%w', Col)`.
 5. Strictness: All non-aggregated columns in SELECT must be in GROUP BY. No CTEs.
 6. Identifiers: Use full `Table`.`Column` names.
+7. Sorting Alignment: If VIS_CONFIG includes sort_info, ensure ORDER BY is consistent with sort_info.by (x|y) and sort_info.order (asc|desc).
 
 ### TASK:
 Synthesize the provided DVCR 2.0 sections into one valid SQL query.

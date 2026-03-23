@@ -75,20 +75,30 @@ Cross-Table Logic: NEVER compare columns from two different DataFrames directly.
 bin_by(Col, 'YEAR'|'MONTH'|'WEEKDAY'):
 Convert to datetime: df['Col'] = pd.to_datetime(df['Col']).
 Extract: 'YEAR' -> .dt.year, 'MONTH' -> .dt.month, 'WEEKDAY' -> .dt.day_name().str[:3].
-Multi-Dimensional Grouping: If the query involves a breakdown (e.g., "by gender"), ensure your .groupby([...]) includes both the X-axis column and the classification (color) column.
+Multi-Dimensional Grouping: Use VIS_CONFIG["classify"] as the semantic grouping key. For aggregated grouped/stacked/multi-series tasks, ensure .groupby([...]) includes both the X-axis column and the classification key.
 Aggregation: Use .groupby(...).agg(alias=('Col', 'func')).reset_index().
 MANDATORY: ALWAYS call .reset_index() after aggregation to keep columns accessible for plotting.
 
 4. [VIS_CONFIG] & Visualization (Final Mapping):
-Classification (3D): If VIS_CONFIG contains a "color" key, you MUST pass it to the plotting helper.
+Classification (3D): Prefer VIS_CONFIG["classify"] for series semantics. "color" is optional rendering channel and can inherit from "classify".
 MANDATORY Call Formats:
-Bar Chart: safe_bar_plot(df, x_name=VIS_CONFIG['x_name'], y_name=VIS_CONFIG['y_name'], color_name=VIS_CONFIG.get('color'), title="...")
+Scatter Chart: safe_scatter_plot(df, x_name=VIS_CONFIG['x_name'], y_name=VIS_CONFIG['y_name'], classify_name=(VIS_CONFIG.get('classify') or VIS_CONFIG.get('color')), mode=VIS_CONFIG.get('scatter_mode', 'plain'), title="...")
+Bar Chart: safe_bar_plot(df, x_name=VIS_CONFIG['x_name'], y_name=VIS_CONFIG['y_name'], color_name=(VIS_CONFIG.get('color') or VIS_CONFIG.get('classify')), bar_mode=VIS_CONFIG.get('bar_mode', 'plain'), sort_info=VIS_CONFIG.get('sort_info'), title="...")
 Pie Chart: safe_pie_plot(df, x_name=VIS_CONFIG['x_name'], y_name=VIS_CONFIG['y_name'], title="...")
 
+Grouped Scatter Strict Rule:
+If chart is scatter and mode is grouped (or classify exists), you MUST draw one scatter trace per classify group and show legend.
+FORBIDDEN in grouped scatter: using `c=...`, `cmap=...`, and `plt.colorbar(...)` to encode classify.
+
+Bar Sorting Strict Rule:
+If VIS_CONFIG includes sort_info for bar charts, you MUST pass sort_info into safe_bar_plot and preserve that order in the plotted result.
+
 ## ABSOLUTE MANDATORY RULES (FORBIDDEN ACTIONS):
-1. DO NOT REDEFINE FUNCTIONS: NEVER write def safe_merge, def safe_bar_plot, or def safe_pie_plot. They are already defined in the environment.
+1. DO NOT REDEFINE FUNCTIONS: NEVER write def safe_merge, def safe_scatter_plot, def safe_bar_plot, or def safe_pie_plot. They are already defined in the environment.
 2. USE safe_merge ONLY: NEVER use df.merge(). Use the global safe_merge.
 3. NO .values ASSIGNMENT: Never assign columns using .values. Use proper pandas joining or mapping.
+4. NO CUSTOM PLOTTING HELPERS: NEVER define extra plotting helpers in the generated code (e.g., def my_bar_plot / def plot_grouped). Always call the provided safe_* helpers directly.
+5. BAR MODE CONSISTENCY: If VIS_CONFIG['bar_mode'] is provided, plotting behavior MUST match it exactly. Do not emulate grouped/stacked with ad-hoc loops.
 
 ## Execution Requirements:
 Tables matching Schema names are already loaded as variables.
@@ -155,18 +165,121 @@ class DVCRValidator:
         if not vis_config:
             return False, ["❌ [VIS_CONFIG] is not valid JSON."]
 
+        # 2.5 兼容归一化：classify <-> color
+        if not vis_config.get("classify") and vis_config.get("color"):
+            vis_config["classify"] = vis_config.get("color")
+            messages.append("ℹ️ Compatibility: mapped classify <- color.")
+        if not vis_config.get("color") and vis_config.get("classify"):
+            vis_config["color"] = vis_config.get("classify")
+
         # 3. 语义约束检查 (Chart Type)
         chart_type = vis_config.get("chart") or vis_config.get("chart_type")
         if not chart_type:
             messages.append("❌ Missing 'chart' key in VIS_CONFIG.")
             is_valid = False
         else:
-            req_fields = self.chart_requirements.get(chart_type.lower(), [])
+            chart_lower = chart_type.lower()
+            req_fields = self.chart_requirements.get(chart_lower, [])
             for f in req_fields:
                 # 同时兼容 x_axis/x_name
                 if f not in vis_config and f.replace("name", "axis") not in vis_config:
                     messages.append(f"❌ Chart '{chart_type}' requires '{f}'.")
                     is_valid = False
+
+            def _contains_col_in_transform(col_name):
+                if not col_name:
+                    return False
+                transform_text = (vis_transform or "").replace("`", "").lower()
+                full_name = str(col_name).replace("`", "").strip().lower()
+                short_name = full_name.split(".")[-1]
+                if full_name in transform_text:
+                    return True
+                return re.search(rf"\b{re.escape(short_name)}\b", transform_text) is not None
+
+            classify_col = vis_config.get("classify")
+            transform_lower = (vis_transform or "").lower()
+
+            def _has_sort_intent(text):
+                t = (text or "").lower()
+                return (
+                    "orderby(" in t
+                    or "order by" in t
+                    or ".sort_values(" in t
+                    or "sort_values(" in t
+                )
+
+            def _validate_sort_info(sort_info):
+                if sort_info is None:
+                    return False, "missing 'sort_info'."
+                if not isinstance(sort_info, dict):
+                    return False, "'sort_info' must be an object."
+                by = str(sort_info.get("by", "")).lower()
+                order = str(sort_info.get("order", "")).lower()
+                if by not in {"x", "y"}:
+                    return False, "'sort_info.by' must be 'x' or 'y'."
+                if order not in {"asc", "desc", "ascending", "descending"}:
+                    return False, "'sort_info.order' must be asc|desc."
+                return True, ""
+
+            if chart_lower == "scatter":
+                scatter_mode = (vis_config.get("scatter_mode") or ("grouped" if classify_col else "plain")).lower()
+                vis_config["scatter_mode"] = scatter_mode
+                if scatter_mode not in {"plain", "grouped"}:
+                    messages.append("❌ Invalid scatter_mode. Allowed: plain, grouped.")
+                    is_valid = False
+                if scatter_mode == "grouped":
+                    if not classify_col:
+                        messages.append("❌ scatter_mode='grouped' requires 'classify'.")
+                        is_valid = False
+                    elif not _contains_col_in_transform(classify_col):
+                        messages.append("❌ grouped scatter requires classify to appear in [VIS_TRANSFORM].")
+                        is_valid = False
+
+            elif chart_lower == "bar":
+                bar_mode = (vis_config.get("bar_mode") or ("grouped" if classify_col else "plain")).lower()
+                vis_config["bar_mode"] = bar_mode
+                if bar_mode not in {"plain", "grouped", "stacked"}:
+                    messages.append("❌ Invalid bar_mode. Allowed: plain, grouped, stacked.")
+                    is_valid = False
+                if bar_mode in {"grouped", "stacked"}:
+                    if not classify_col:
+                        messages.append(f"❌ bar_mode='{bar_mode}' requires 'classify'.")
+                        is_valid = False
+                    else:
+                        if "groupby" not in transform_lower:
+                            messages.append(f"❌ bar_mode='{bar_mode}' requires groupby in [VIS_TRANSFORM].")
+                            is_valid = False
+                        if not _contains_col_in_transform(classify_col):
+                            messages.append(f"❌ bar_mode='{bar_mode}' requires classify to appear in [VIS_TRANSFORM].")
+                            is_valid = False
+                sort_info = vis_config.get("sort_info")
+                sort_intent_detected = _has_sort_intent(vis_transform)
+                if sort_intent_detected:
+                    ok, reason = _validate_sort_info(sort_info)
+                    if not ok:
+                        messages.append(f"❌ bar sort intent detected in [VIS_TRANSFORM], but {reason}")
+                        is_valid = False
+                elif sort_info is not None:
+                    ok, reason = _validate_sort_info(sort_info)
+                    if not ok:
+                        messages.append(f"❌ Invalid sort_info: {reason}")
+                        is_valid = False
+
+            elif chart_lower == "line":
+                line_mode = (vis_config.get("line_mode") or ("multi_series" if classify_col else "single")).lower()
+                vis_config["line_mode"] = line_mode
+                if line_mode not in {"single", "multi_series"}:
+                    messages.append("❌ Invalid line_mode. Allowed: single, multi_series.")
+                    is_valid = False
+                if line_mode == "multi_series":
+                    if not classify_col:
+                        messages.append("❌ line_mode='multi_series' requires 'classify'.")
+                        is_valid = False
+                    elif not _contains_col_in_transform(classify_col):
+                        messages.append("❌ multi_series line requires classify to appear in [VIS_TRANSFORM].")
+                        is_valid = False
+                    if "orderby" not in transform_lower:
+                        messages.append("💡 Suggestion: multi_series line usually needs orderby on x axis.")
 
         # 4. 数据流与变换层字段存在性检查
         # 提取两个段落中所有 `Table`.`Column` 格式的列
@@ -186,7 +299,7 @@ class DVCRValidator:
         
         # 6. 可视化配置字段合规性检查
         used_cols_in_vis = []
-        for key in ["x_name", "x_axis", "y_name", "y_axis", "color"]:
+        for key in ["x_name", "x_axis", "y_name", "y_axis", "classify", "color"]:
             if key in vis_config: used_cols_in_vis.append(str(vis_config[key]))
 
         for col in used_cols_in_vis:
@@ -350,8 +463,31 @@ class Coder:
         injection_lines.append("    return pd.merge(df1, df2, left_on=l_on, right_on=r_on, how=how, suffixes=('_src', '_tgt'))")
         injection_lines.append("")
         
-        # 2. 升级版 safe_bar_plot：内建强制排序与透视
-        injection_lines.append("def safe_bar_plot(df, x_name, y_name, color_name=None, title='', sort_info=None):")
+        # 2. safe_scatter_plot：严格分组散点（避免连续色条导致通道丢失）
+        injection_lines.append("def safe_scatter_plot(df, x_name, y_name, classify_name=None, mode='plain', title=''):")
+        injection_lines.append("    fig, ax = plt.subplots(figsize=(10, 6))")
+        injection_lines.append("    if df is None or df.empty:")
+        injection_lines.append("        ax.text(0.5, 0.5, 'Empty Data', ha='center'); plt.savefig('output.png'); return")
+        injection_lines.append("    def fix_c(c):")
+        injection_lines.append("        if not c or c in df.columns: return c")
+        injection_lines.append("        matched = [col for col in df.columns if col.endswith('.' + c)]")
+        injection_lines.append("        return matched[0] if matched else c")
+        injection_lines.append("    x, y, k = fix_c(x_name), fix_c(y_name), fix_c(classify_name)")
+        injection_lines.append("    scatter_mode = (mode or ('grouped' if k else 'plain')).lower()")
+        injection_lines.append("    if scatter_mode == 'grouped' and k and k in df.columns:")
+        injection_lines.append("        for label, grp in df.groupby(k, observed=False):")
+        injection_lines.append("            ax.scatter(grp[x], grp[y], label=str(label), alpha=0.8)")
+        injection_lines.append("        if df[k].nunique(dropna=False) > 1:")
+        injection_lines.append("            ax.legend(title=str(k).split('.')[-1])")
+        injection_lines.append("    else:")
+        injection_lines.append("        ax.scatter(df[x], df[y], alpha=0.8)")
+        injection_lines.append("    ax.set_title(title)")
+        injection_lines.append("    ax.set_xlabel(str(x).split('.')[-1]); ax.set_ylabel(str(y).split('.')[-1])")
+        injection_lines.append("    plt.tight_layout(); plt.savefig('output.png')")
+        injection_lines.append("")
+
+        # 3. 升级版 safe_bar_plot：内建强制排序与透视
+        injection_lines.append("def safe_bar_plot(df, x_name, y_name, color_name=None, bar_mode='plain', title='', sort_info=None):")
         injection_lines.append("    fig, ax = plt.subplots(figsize=(10, 6))")
         injection_lines.append("    if df is None or df.empty:")
         injection_lines.append("        ax.text(0.5, 0.5, 'Empty Data', ha='center'); plt.savefig('output.png'); return")
@@ -362,6 +498,9 @@ class Coder:
         injection_lines.append("        matched = [col for col in df.columns if col.endswith('.' + c)]")
         injection_lines.append("        return matched[0] if matched else c")
         injection_lines.append("    x, y, c = fix_c(x_name), fix_c(y_name), fix_col(color_name) if 'fix_col' in locals() else fix_c(color_name)")
+        injection_lines.append("    mode = (bar_mode or ('grouped' if c else 'plain')).lower()")
+        injection_lines.append("    if mode not in {'plain', 'grouped', 'stacked'}:")
+        injection_lines.append("        mode = 'plain'")
         
         # B. DVCR 2.2 视觉意图排序
         injection_lines.append("    totals = df.groupby(x, observed=False)[y].sum()")
@@ -378,11 +517,12 @@ class Coder:
         injection_lines.append("    df[x] = pd.Categorical(df[x], categories=order, ordered=True)")
         
         # C. 绘图执行
-        injection_lines.append("    if c and c in df.columns:")
-        injection_lines.append("        pivot_df = df.pivot_table(index=x, columns=c, values=y, aggfunc='sum', observed=False).fillna(0)")
-        injection_lines.append("        pivot_df.sort_index().plot(kind='bar', stacked=True, ax=ax)")
+        injection_lines.append("    if c and c in df.columns and mode in {'grouped', 'stacked'}:")
+        injection_lines.append("        pivot_df = df.pivot_table(index=x, columns=c, values=y, aggfunc='sum', observed=False)")
+        injection_lines.append("        pivot_df = pivot_df.reindex(order).fillna(0)")
+        injection_lines.append("        pivot_df.plot(kind='bar', stacked=(mode == 'stacked'), ax=ax)")
         injection_lines.append("    else:")
-        injection_lines.append("        plot_df = df.groupby(x, observed=False)[y].sum().sort_index()")
+        injection_lines.append("        plot_df = df.groupby(x, observed=False)[y].sum().reindex(order)")
         injection_lines.append("        plot_df.plot(kind='bar', ax=ax)")
         
         # D. 收尾
@@ -392,7 +532,7 @@ class Coder:
         injection_lines.append("    plt.savefig('output.png')")
         injection_lines.append("")
 
-        # 3. 升级版 safe_pie_plot
+        # 4. 升级版 safe_pie_plot
         injection_lines.append("def safe_pie_plot(df, x_name, y_name, title=''):")
         injection_lines.append("    fig, ax = plt.subplots(figsize=(8, 8))")
         injection_lines.append("    if df is None or df.empty:")

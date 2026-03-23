@@ -447,17 +447,39 @@ def validate_vis_config(pred_config, gold_vis):
     """基于语义和 Protocol v1.0 的可视化匹配"""
     if not pred_config or not gold_vis:
         return False
-        
+
+    # 0. 兼容归一化：classify <-> color
+    cfg = dict(pred_config)
+    if not cfg.get('classify') and cfg.get('color'):
+        cfg['classify'] = cfg.get('color')
+    if not cfg.get('color') and cfg.get('classify'):
+        cfg['color'] = cfg.get('classify')
+
     # 1. 校验图表类型 (chart vs chart_type)
-    pred_chart = (pred_config.get('chart') or pred_config.get('chart_type', '')).lower()
+    pred_chart = (cfg.get('chart') or cfg.get('chart_type', '')).lower()
     gold_chart = gold_vis.get('chart', '').lower()
     if pred_chart != gold_chart:
         return False
-        
+
+    # 1.5 模式与分类约束（最小语义约束）
+    classify = cfg.get('classify')
+    if pred_chart == 'scatter':
+        scatter_mode = (cfg.get('scatter_mode') or ('grouped' if classify else 'plain')).lower()
+        if scatter_mode == 'grouped' and not classify:
+            return False
+    elif pred_chart == 'bar':
+        bar_mode = (cfg.get('bar_mode') or ('grouped' if classify else 'plain')).lower()
+        if bar_mode in {'grouped', 'stacked'} and not classify:
+            return False
+    elif pred_chart == 'line':
+        line_mode = (cfg.get('line_mode') or ('multi_series' if classify else 'single')).lower()
+        if line_mode == 'multi_series' and not classify:
+            return False
+
     # 2. 校验轴字段 (允许全称匹配和别名语义匹配)
-    pred_x = pred_config.get('x_name') or pred_config.get('x_axis') or pred_config.get('labels')
-    pred_y = pred_config.get('y_name') or pred_config.get('y_axis') or pred_config.get('values')
-    
+    pred_x = cfg.get('x_name') or cfg.get('x_axis') or cfg.get('labels')
+    pred_y = cfg.get('y_name') or cfg.get('y_axis') or cfg.get('values')
+
     gold_x = gold_vis.get('x_name')
     gold_y = gold_vis.get('y_name')
 

@@ -141,14 +141,24 @@ def print_analysis_summary(all_analyses: List[Dict]):
     
     # --- 3. 统计失败原因（含 SQL 校验失败） ---
     all_failure_reasons = Counter()
-    sql_val_fail_count = 0
+    stage03_failed_queries = 0
     for analysis in all_analyses:
         all_failure_reasons.update(analysis['failure_reasons'])
         for q_detail in analysis['query_details']:
             # 这里的判定逻辑需与 05 脚本中返回的标记一致
+            has_stage03_fail = False
             for fail in q_detail['failures']:
                 if "SQL Validation Failed" in str(fail.get('reason', '')):
-                    sql_val_fail_count += 1
+                    has_stage03_fail = True
+            if has_stage03_fail:
+                stage03_failed_queries += 1
+
+    # 通过 Stage 03 检验并进入 DVCR 图像生成阶段后的查询准确率
+    dvcr_generated_queries = total_queries - stage03_failed_queries
+    dvcr_generated_acc = (
+        total_passed / dvcr_generated_queries * 100
+        if dvcr_generated_queries > 0 else 0
+    )
                     
     data_check_failures = []
     for analysis in all_analyses:
@@ -173,13 +183,15 @@ def print_analysis_summary(all_analyses: List[Dict]):
     
     print(f"\n  🔹 查询级准确率 (Query-level): {query_acc:.2f}%")
     print(f"     (总通过查询数/总查询数: {total_passed} / {total_queries})")
+    print(f"\n  🧭 通过 Stage 03 检验后的 DVCR 生成图像正确率: {dvcr_generated_acc:.2f}%")
+    print(f"     (总通过查询数/(总查询数-Stage 03 失败查询数): {total_passed} / {dvcr_generated_queries})")
     
     print(f"\n📈 统计详情:")
     print(f"  • 总实例数: {total_instances}")
     print(f"  • 总查询数: {total_queries}")
     print(f"  • 失败查询数: {total_failed}")
-    if sql_val_fail_count > 0:
-        print(f"    - 其中由于 Stage 03 校验失败导致的无代码生成: {sql_val_fail_count}")
+    if stage03_failed_queries > 0:
+        print(f"    - 其中由于 Stage 03 校验失败导致的无代码生成: {stage03_failed_queries}")
     
     print(f"\n🔍 失败原因分布 (Top 10):")
     if not all_failure_reasons:
@@ -318,4 +330,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
