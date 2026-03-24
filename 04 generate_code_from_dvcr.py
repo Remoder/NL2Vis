@@ -8,6 +8,7 @@ import traceback
 import argparse
 import glob
 import warnings
+import time
 
 # --- Configuration ---
 # 配置 API Key 和 Base URL，默认使用环境变量，否则使用硬编码的默认值
@@ -22,7 +23,47 @@ if not BASE_URL.endswith("/v1"):
 
 client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
 
-def call_llm(system_prompt, user_prompt, model="gpt-4o"):
+TOKEN_LOG_PATH = None
+TOKEN_RUN_ID = None
+TOKEN_STAGE = "stage04_generate_code"
+TOKEN_DB_ID = "ALL"
+
+
+def init_token_logger(project_root, db_id):
+    global TOKEN_LOG_PATH, TOKEN_RUN_ID, TOKEN_DB_ID
+    TOKEN_DB_ID = db_id or "ALL"
+    TOKEN_RUN_ID = time.strftime("%Y%m%d_%H%M%S")
+    token_dir = os.path.join(project_root, "logs", "token_usage")
+    os.makedirs(token_dir, exist_ok=True)
+    TOKEN_LOG_PATH = os.path.join(token_dir, f"{TOKEN_STAGE}.jsonl")
+
+
+def log_token_usage(response, model, meta=None):
+    if not TOKEN_LOG_PATH:
+        return
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return
+    try:
+        record = {
+            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "run_id": TOKEN_RUN_ID,
+            "stage": TOKEN_STAGE,
+            "db_id": TOKEN_DB_ID,
+            "model": model,
+            "prompt_tokens": int(getattr(usage, "prompt_tokens", 0) or 0),
+            "completion_tokens": int(getattr(usage, "completion_tokens", 0) or 0),
+            "total_tokens": int(getattr(usage, "total_tokens", 0) or 0),
+        }
+        if isinstance(meta, dict):
+            record.update(meta)
+        with open(TOKEN_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def call_llm(system_prompt, user_prompt, model="gpt-4o", meta=None):
     """
     调用 LLM 的通用函数。
     system_prompt: 系统提示词，设定角色。
@@ -37,6 +78,7 @@ def call_llm(system_prompt, user_prompt, model="gpt-4o"):
             ],
             temperature=0.0 # 设置为 0 以保证输出的确定性
         )
+        log_token_usage(response=response, model=model, meta=meta)
         return response.choices[0].message.content
     except Exception as e:
         print(f"LLM Error: {e}")
@@ -83,6 +125,7 @@ MANDATORY: ALWAYS call .reset_index() after aggregation to keep columns accessib
 Classification (3D): Prefer VIS_CONFIG["classify"] for series semantics. "color" is optional rendering channel and can inherit from "classify".
 MANDATORY Call Formats:
 Scatter Chart: safe_scatter_plot(df, x_name=VIS_CONFIG['x_name'], y_name=VIS_CONFIG['y_name'], classify_name=(VIS_CONFIG.get('classify') or VIS_CONFIG.get('color')), mode=VIS_CONFIG.get('scatter_mode', 'plain'), title="...")
+Line Chart: safe_line_plot(df, x_name=VIS_CONFIG['x_name'], y_name=VIS_CONFIG['y_name'], classify_name=(VIS_CONFIG.get('classify') or VIS_CONFIG.get('color')), line_mode=VIS_CONFIG.get('line_mode', 'single'), sort_info=VIS_CONFIG.get('sort_info'), title="...")
 Bar Chart: safe_bar_plot(df, x_name=VIS_CONFIG['x_name'], y_name=VIS_CONFIG['y_name'], color_name=(VIS_CONFIG.get('color') or VIS_CONFIG.get('classify')), bar_mode=VIS_CONFIG.get('bar_mode', 'plain'), sort_info=VIS_CONFIG.get('sort_info'), title="...")
 Pie Chart: safe_pie_plot(df, x_name=VIS_CONFIG['x_name'], y_name=VIS_CONFIG['y_name'], title="...")
 
@@ -94,7 +137,7 @@ Bar Sorting Strict Rule:
 If VIS_CONFIG includes sort_info for bar charts, you MUST pass sort_info into safe_bar_plot and preserve that order in the plotted result.
 
 ## ABSOLUTE MANDATORY RULES (FORBIDDEN ACTIONS):
-1. DO NOT REDEFINE FUNCTIONS: NEVER write def safe_merge, def safe_scatter_plot, def safe_bar_plot, or def safe_pie_plot. They are already defined in the environment.
+1. DO NOT REDEFINE FUNCTIONS: NEVER write def safe_merge, def safe_scatter_plot, def safe_line_plot, def safe_bar_plot, or def safe_pie_plot. They are already defined in the environment.
 2. USE safe_merge ONLY: NEVER use df.merge(). Use the global safe_merge.
 3. NO .values ASSIGNMENT: Never assign columns using .values. Use proper pandas joining or mapping.
 4. NO CUSTOM PLOTTING HELPERS: NEVER define extra plotting helpers in the generated code (e.g., def my_bar_plot / def plot_grouped). Always call the provided safe_* helpers directly.
@@ -379,7 +422,7 @@ class Coder:
     """
     代码生成器：负责调用 LLM 生成代码，并注入必要的 Header 和 Helper Functions。
     """
-    def gen_code(self, dvcr_text, query, csv_files, db_path, schema_data):   
+    def gen_code(self, dvcr_text, query, csv_files, db_path, schema_data, request_meta=None):   
         simple_schema = schema_data['simple_schema_list']
         col_desc = schema_data['column_descriptions']
 
@@ -392,7 +435,7 @@ class Coder:
         )
 
         system_prompt = "You are a Python Visualization Expert. Use full Table.Column prefixes."
-        code_resp = call_llm(system_prompt, user_prompt)
+        code_resp = call_llm(system_prompt, user_prompt, meta=request_meta)
         
         match = re.search(r'```python(.*?)```', code_resp, re.DOTALL)
         llm_code = match.group(1).strip() if match else code_resp
@@ -486,7 +529,43 @@ class Coder:
         injection_lines.append("    plt.tight_layout(); plt.savefig('output.png')")
         injection_lines.append("")
 
-        # 3. 升级版 safe_bar_plot：内建强制排序与透视
+        # 3. safe_line_plot：兼容 single / multi_series 折线
+        injection_lines.append("def safe_line_plot(df, x_name, y_name, classify_name=None, line_mode='single', title='', sort_info=None):")
+        injection_lines.append("    fig, ax = plt.subplots(figsize=(10, 6))")
+        injection_lines.append("    if df is None or df.empty:")
+        injection_lines.append("        ax.text(0.5, 0.5, 'Empty Data', ha='center'); plt.savefig('output.png'); return")
+        injection_lines.append("    def fix_c(c):")
+        injection_lines.append("        if not c or c in df.columns: return c")
+        injection_lines.append("        matched = [col for col in df.columns if col.endswith('.' + c)]")
+        injection_lines.append("        return matched[0] if matched else c")
+        injection_lines.append("    x, y, k = fix_c(x_name), fix_c(y_name), fix_c(classify_name)")
+        injection_lines.append("    mode = (line_mode or ('multi_series' if k else 'single')).lower()")
+        injection_lines.append("    plot_df = df.copy()")
+        injection_lines.append("    if sort_info and isinstance(sort_info, dict):")
+        injection_lines.append("        by = str(sort_info.get('by', '')).lower()")
+        injection_lines.append("        order = str(sort_info.get('order', 'asc')).lower()")
+        injection_lines.append("        is_asc = order in {'asc', 'ascending'}")
+        injection_lines.append("        if by == 'x' and x in plot_df.columns:")
+        injection_lines.append("            plot_df = plot_df.sort_values(by=x, ascending=is_asc)")
+        injection_lines.append("        elif by == 'y' and y in plot_df.columns:")
+        injection_lines.append("            plot_df = plot_df.sort_values(by=y, ascending=is_asc)")
+        injection_lines.append("    elif x in plot_df.columns:")
+        injection_lines.append("        plot_df = plot_df.sort_values(by=x, ascending=True)")
+        injection_lines.append("    if mode == 'multi_series' and k and k in plot_df.columns:")
+        injection_lines.append("        for label, grp in plot_df.groupby(k, observed=False):")
+        injection_lines.append("            if x in grp.columns:")
+        injection_lines.append("                grp = grp.sort_values(by=x, ascending=True)")
+        injection_lines.append("            ax.plot(grp[x], grp[y], marker='o', label=str(label))")
+        injection_lines.append("        if plot_df[k].nunique(dropna=False) > 1:")
+        injection_lines.append("            ax.legend(title=str(k).split('.')[-1])")
+        injection_lines.append("    else:")
+        injection_lines.append("        ax.plot(plot_df[x], plot_df[y], marker='o')")
+        injection_lines.append("    ax.set_title(title)")
+        injection_lines.append("    ax.set_xlabel(str(x).split('.')[-1]); ax.set_ylabel(str(y).split('.')[-1])")
+        injection_lines.append("    plt.xticks(rotation=45); plt.tight_layout(); plt.savefig('output.png')")
+        injection_lines.append("")
+
+        # 4. 升级版 safe_bar_plot：内建强制排序与透视
         injection_lines.append("def safe_bar_plot(df, x_name, y_name, color_name=None, bar_mode='plain', title='', sort_info=None):")
         injection_lines.append("    fig, ax = plt.subplots(figsize=(10, 6))")
         injection_lines.append("    if df is None or df.empty:")
@@ -532,7 +611,7 @@ class Coder:
         injection_lines.append("    plt.savefig('output.png')")
         injection_lines.append("")
 
-        # 4. 升级版 safe_pie_plot
+        # 5. 升级版 safe_pie_plot
         injection_lines.append("def safe_pie_plot(df, x_name, y_name, title=''):")
         injection_lines.append("    fig, ax = plt.subplots(figsize=(8, 8))")
         injection_lines.append("    if df is None or df.empty:")
@@ -568,6 +647,7 @@ def main():
     project_root = os.path.dirname(current_script_dir) 
     dataset_root = os.path.join(project_root, "dataset")
     sft_file = os.path.join(project_root, "temp_results", "sft_data", "sft_advised_data.jsonl")
+    init_token_logger(project_root=project_root, db_id=target_db_id)
     
     # if not os.path.exists(dataset_root):
     #     dataset_root = "/root/nl2vis/VisEval-main/visEval_dataset"
@@ -644,7 +724,19 @@ def main():
         
         try:
             # 生成代码
-            code = coder.gen_code(dvcr_content, question, csv_files, db_path, schema_data)
+            code = coder.gen_code(
+                dvcr_content,
+                question,
+                csv_files,
+                db_path,
+                schema_data,
+                request_meta={
+                    "q_id": str(q_id),
+                    "db_id": target_db_id,
+                    "query_index": int(current_idx),
+                    "task": "dvcr2code",
+                },
+            )
             
             # Save with correct index suffix
             safe_name = f"{q_id}_{current_idx}.txt" 

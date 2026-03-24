@@ -22,7 +22,47 @@ if not BASE_URL.endswith("/v1"):
 
 client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
 
-def call_llm(user_prompt, system_prompt="You are an expert about text-to-SQL and pandas code.", max_retries=3, model="gpt-4o"):
+TOKEN_LOG_PATH = None
+TOKEN_RUN_ID = None
+TOKEN_STAGE = "stage02_generate_sft"
+TOKEN_DB_ID = "ALL"
+
+
+def init_token_logger(project_root, db_id):
+    global TOKEN_LOG_PATH, TOKEN_RUN_ID, TOKEN_DB_ID
+    TOKEN_DB_ID = db_id or "ALL"
+    TOKEN_RUN_ID = time.strftime("%Y%m%d_%H%M%S")
+    token_dir = os.path.join(project_root, "logs", "token_usage")
+    os.makedirs(token_dir, exist_ok=True)
+    TOKEN_LOG_PATH = os.path.join(token_dir, f"{TOKEN_STAGE}.jsonl")
+
+
+def log_token_usage(response, model, meta=None):
+    if not TOKEN_LOG_PATH:
+        return
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return
+    try:
+        record = {
+            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "run_id": TOKEN_RUN_ID,
+            "stage": TOKEN_STAGE,
+            "db_id": TOKEN_DB_ID,
+            "model": model,
+            "prompt_tokens": int(getattr(usage, "prompt_tokens", 0) or 0),
+            "completion_tokens": int(getattr(usage, "completion_tokens", 0) or 0),
+            "total_tokens": int(getattr(usage, "total_tokens", 0) or 0),
+        }
+        if isinstance(meta, dict):
+            record.update(meta)
+        with open(TOKEN_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def call_llm(user_prompt, system_prompt="You are an expert about text-to-SQL and pandas code.", max_retries=3, model="gpt-4o", meta=None):
     for attempt in range(max_retries):
         try:
             response = client.chat.completions.create(
@@ -33,6 +73,7 @@ def call_llm(user_prompt, system_prompt="You are an expert about text-to-SQL and
                 ],
                 temperature=0.0
             )
+            log_token_usage(response=response, model=model, meta=meta)
             return response.choices[0].message.content
         except Exception as e:
             print(f"⚠️ LLM Error (Attempt {attempt+1}/{max_retries}): {e}")
@@ -115,6 +156,7 @@ def main():
     vis_eval_path = os.path.join(project_root, "dataset/visEval.json")
     dataset_root = os.path.join(project_root, "dataset")
     output_file = os.path.join(project_root, "temp_results", "sft_data", "sft_origin_data.jsonl")
+    init_token_logger(project_root=project_root, db_id=args.db_id)
     
     # ---------------------------------------------------------
     # 2. 预处理：确保目录存在并清空旧的目标文件
@@ -193,7 +235,15 @@ def main():
         )
         system_prompt = DVCR_PROTOCOL_SYSTEM_PROMPT
 
-        dvcr_response = call_llm(user_prompt=user_prompt, system_prompt=system_prompt)
+        dvcr_response = call_llm(
+            user_prompt=user_prompt,
+            system_prompt=system_prompt,
+            meta={
+                "q_id": str(q_id),
+                "db_id": db_id,
+                "task": "sql2dvcr",
+            }
+        )
         
         # Clean response
         dvcr_content = dvcr_response.replace("```DVCR", "").replace("```", "").strip()

@@ -1,4 +1,5 @@
 import os
+import argparse
 import json
 import sqlite3
 import pandas as pd
@@ -23,17 +24,58 @@ if not BASE_URL.endswith("/v1"):
 
 client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
 
-def call_llm(user_prompt, system_prompt="You are an expert about text-to-SQL and pandas code.", max_retries=3):
+TOKEN_LOG_PATH = None
+TOKEN_RUN_ID = None
+TOKEN_STAGE = "stage03_validate_sft"
+TOKEN_DB_ID = "ALL"
+
+
+def init_token_logger(project_root, db_id):
+    global TOKEN_LOG_PATH, TOKEN_RUN_ID, TOKEN_DB_ID
+    TOKEN_DB_ID = db_id or "ALL"
+    TOKEN_RUN_ID = time.strftime("%Y%m%d_%H%M%S")
+    token_dir = os.path.join(project_root, "logs", "token_usage")
+    os.makedirs(token_dir, exist_ok=True)
+    TOKEN_LOG_PATH = os.path.join(token_dir, f"{TOKEN_STAGE}.jsonl")
+
+
+def log_token_usage(response, model, meta=None):
+    if not TOKEN_LOG_PATH:
+        return
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return
+    try:
+        record = {
+            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "run_id": TOKEN_RUN_ID,
+            "stage": TOKEN_STAGE,
+            "db_id": TOKEN_DB_ID,
+            "model": model,
+            "prompt_tokens": int(getattr(usage, "prompt_tokens", 0) or 0),
+            "completion_tokens": int(getattr(usage, "completion_tokens", 0) or 0),
+            "total_tokens": int(getattr(usage, "total_tokens", 0) or 0),
+        }
+        if isinstance(meta, dict):
+            record.update(meta)
+        with open(TOKEN_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def call_llm(user_prompt, system_prompt="You are an expert about text-to-SQL and pandas code.", max_retries=3, model="gpt-4o", meta=None):
     for attempt in range(max_retries):
         try:
             response = client.chat.completions.create(
-                model="gpt-4o",
+                model=model,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
                 ],
                 temperature=0.0
             )
+            log_token_usage(response=response, model=model, meta=meta)
             return response.choices[0].message.content
         except Exception as e:
             print(f"⚠️ LLM Error (Attempt {attempt+1}/{max_retries}): {e}")
@@ -596,7 +638,7 @@ def validate_against_vis_obj(df_gen, vis_obj):
     except Exception as e:
         return False, f"Comparison Error: {e}"
 
-def validate_and_filter(sft_file_path, dataset_root, output_file_path):
+def validate_and_filter(sft_file_path, dataset_root, output_file_path, target_db_id=None):
     from tqdm import tqdm
     
     vis_eval_path = os.path.join(dataset_root, "visEval.json")
@@ -624,6 +666,9 @@ def validate_and_filter(sft_file_path, dataset_root, output_file_path):
         question = item['input']
         dvcr_output = item['output']
         gold_vis = item['gold_vis']
+
+        if target_db_id and db_id != target_db_id:
+            continue
 
         if q_id not in ground_truth_data: continue
         target_vis_obj = ground_truth_data[q_id].get('vis_obj')
@@ -676,7 +721,14 @@ def validate_and_filter(sft_file_path, dataset_root, output_file_path):
                     vis_transform=vis_transform,
                     vis_config=json.dumps(vis_config),
                 )
-                gen_sql_resp = call_llm(prompt)
+                gen_sql_resp = call_llm(
+                    prompt,
+                    meta={
+                        "q_id": str(q_id),
+                        "db_id": db_id,
+                        "task": "sr2sql_check",
+                    }
+                )
                 gen_sql_raw = extract_sql(gen_sql_resp)
                 gen_sql_fixed = coerce_weekday_labels(sanitize_sql_literals(gen_sql_raw))
 
@@ -731,11 +783,16 @@ def validate_and_filter(sft_file_path, dataset_root, output_file_path):
             f.write(json.dumps(item) + "\n")
             
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Validate SFT Data")
+    parser.add_argument("--db_id", type=str, default=None, help="指定要处理的数据库ID (例如: hospital_1)")
+    args = parser.parse_args()
+
     current_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.dirname(current_dir)
     dataset_root = os.path.join(project_root, "dataset")
     input_file = os.path.join(project_root, "temp_results", "sft_data", "sft_origin_data.jsonl")
     output_file = os.path.join(project_root, "temp_results", "sft_data", "sft_advised_data.jsonl")
+    init_token_logger(project_root=project_root, db_id=args.db_id)
     
     print(f"Cleaning output file: {output_file}")
     with open(output_file, 'w', encoding='utf-8') as f:
@@ -744,6 +801,6 @@ if __name__ == "__main__":
     #     dataset_root = "/root/nl2vis/VisEval-main/visEval_dataset"
     
     if os.path.exists(input_file):
-        validate_and_filter(input_file, dataset_root, output_file)
+        validate_and_filter(input_file, dataset_root, output_file, target_db_id=args.db_id)
     else:
         print(f"Error: {input_file} not found. Run generation script first.")
