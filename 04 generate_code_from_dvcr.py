@@ -686,6 +686,19 @@ def main():
     output_path = os.path.join(project_root, "temp_results", "generated_code", target_db_id)
     if not os.path.exists(output_path):
         os.makedirs(output_path)
+    else:
+        # 每轮先清理当前 DB 旧代码，避免历史残留污染 Stage 05 评测
+        stale_patterns = ["*.txt", "*.py"]
+        removed = 0
+        for pat in stale_patterns:
+            for old_file in glob.glob(os.path.join(output_path, pat)):
+                try:
+                    os.remove(old_file)
+                    removed += 1
+                except Exception:
+                    pass
+        if removed:
+            print(f"Cleaned {removed} stale code files in {output_path}")
 
     coder = Coder()
     validator = DVCRValidator(schema_data.get('column_types'))

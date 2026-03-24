@@ -92,7 +92,7 @@ def main():
 
     # 定义各项路径
     scripts_dir = os.path.join(root, "codes")
-    code_folder = os.path.join(root, "temp_results/generated_code/")
+    code_folder_root = os.path.join(root, "temp_results", "generated_code")
     benchmark_path = os.path.join(root, "dataset/")
 
     python_bin = sys.executable
@@ -101,6 +101,8 @@ def main():
     print(f"\n🚀 启动流水线 | Target DBs: {', '.join(db_ids)}")
 
     for db_index, db_id in enumerate(db_ids, start=1):
+        # Stage 05 仅评估当前 DB 代码目录，避免跨库/历史文件污染
+        code_folder = os.path.join(code_folder_root, db_id)
         # 日志目录与文件
         log_dir = os.path.join(root, "logs", f"logs_static_eval_{db_id}")
         os.makedirs(log_dir, exist_ok=True)

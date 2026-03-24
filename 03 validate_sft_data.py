@@ -7,6 +7,7 @@ import multiprocessing as mp
 import re, time
 import glob, duckdb, sqlglot
 from collections import Counter
+from sqlglot import exp
 from tqdm import tqdm
 from func_timeout import func_timeout, FunctionTimedOut
 from openai import OpenAI
@@ -28,6 +29,7 @@ TOKEN_LOG_PATH = None
 TOKEN_RUN_ID = None
 TOKEN_STAGE = "stage03_validate_sft"
 TOKEN_DB_ID = "ALL"
+MAX_SQL_REPAIR_ROUNDS = 2
 
 
 def init_token_logger(project_root, db_id):
@@ -121,6 +123,7 @@ def extract_sql(llm_response):
 
 # --- 全局数据库连接缓存（提升 10 倍以上速度） ---
 DB_CACHE = {}
+DB_SCHEMA_CACHE = {}
 
 def get_duckdb_connection(db_path):
     """缓存 DuckDB 内存连接，避免每验证一条数据就重新读取一遍 CSV 磁盘文件"""
@@ -136,6 +139,279 @@ def get_duckdb_connection(db_path):
     
     DB_CACHE[db_path] = con
     return con
+
+
+def _quote_ident(name):
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def get_schema_index(con, db_path):
+    """
+    构建并缓存当前数据库的表/列索引（小写），供 SQL 前置约束校验使用。
+    """
+    if db_path in DB_SCHEMA_CACHE:
+        return DB_SCHEMA_CACHE[db_path]
+
+    schema_index = {}
+    try:
+        table_rows = con.execute("SHOW TABLES").fetchall()
+    except Exception:
+        table_rows = []
+
+    for row in table_rows:
+        if not row:
+            continue
+        table_name = str(row[0])
+        table_key = table_name.lower()
+        columns = set()
+        try:
+            desc_rows = con.execute(f"DESCRIBE {_quote_ident(table_name)}").fetchall()
+            for d in desc_rows:
+                if d:
+                    columns.add(str(d[0]).lower())
+        except Exception:
+            pass
+        schema_index[table_key] = columns
+
+    DB_SCHEMA_CACHE[db_path] = schema_index
+    return schema_index
+
+
+def extract_sql_references(sql_str):
+    """
+    从 SQL 中提取：
+    - 真实表名
+    - 表别名 -> 真实表名映射
+    - CTE 名称
+    - 派生表别名（子查询别名）
+    - SELECT 投影别名
+    - 列引用（含可选表限定）
+    """
+    if not sql_str:
+        return None, "Empty SQL"
+
+    parsed = None
+    parse_error = None
+    for dialect in ("sqlite", "duckdb", None):
+        try:
+            if dialect:
+                parsed = sqlglot.parse_one(sql_str, read=dialect)
+            else:
+                parsed = sqlglot.parse_one(sql_str)
+            if parsed is not None:
+                break
+        except Exception as e:
+            parse_error = str(e)
+            continue
+
+    if parsed is None:
+        return None, f"SQL parse failed: {parse_error}"
+
+    real_tables = set()
+    alias_to_table = {}
+    cte_names = set()
+    derived_aliases = set()
+    select_aliases = set()
+    columns = []
+
+    for cte_expr in parsed.find_all(exp.CTE):
+        alias_name = (cte_expr.alias or "").strip()
+        if alias_name:
+            cte_names.add(alias_name.lower())
+
+    for table_expr in parsed.find_all(exp.Table):
+        table_name = (table_expr.name or "").strip()
+        if not table_name:
+            continue
+        table_key = table_name.lower()
+        alias_name = (table_expr.alias or "").strip()
+        # CTE 不是底层真实表，避免误判为 schema 不存在
+        if table_key in cte_names:
+            if alias_name:
+                derived_aliases.add(alias_name.lower())
+            continue
+        real_tables.add(table_key)
+        if alias_name:
+            alias_to_table[alias_name.lower()] = table_key
+
+    for subquery_expr in parsed.find_all(exp.Subquery):
+        alias_name = (subquery_expr.alias or "").strip()
+        if alias_name:
+            derived_aliases.add(alias_name.lower())
+
+    for select_expr in parsed.find_all(exp.Select):
+        for projection in select_expr.expressions or []:
+            alias_name = (projection.alias or "").strip()
+            if alias_name:
+                select_aliases.add(alias_name.lower())
+
+    for col_expr in parsed.find_all(exp.Column):
+        col_name = (col_expr.name or "").strip()
+        if not col_name or col_name == "*":
+            continue
+        tbl_name = (col_expr.table or "").strip()
+        columns.append((tbl_name.lower() if tbl_name else "", col_name.lower()))
+
+    return {
+        "real_tables": real_tables,
+        "alias_to_table": alias_to_table,
+        "cte_names": cte_names,
+        "derived_aliases": derived_aliases,
+        "select_aliases": select_aliases,
+        "columns": columns,
+    }, None
+
+
+def schema_precheck_sql(con, db_path, sql_str):
+    """
+    SQL 执行前基于 schema 做轻量约束校验。
+    仅对可明确映射到真实表的引用做硬校验，避免误杀 CTE/别名列。
+    """
+    refs, ref_err = extract_sql_references(sql_str)
+    if refs is None:
+        # 复杂 SQL 或方言差异导致 parse 失败时，降级到执行器判断，避免硬拦截
+        return True, None
+
+    schema_index = get_schema_index(con, db_path)
+    schema_tables = set(schema_index.keys())
+
+    errors = []
+
+    for t in refs["real_tables"]:
+        if t not in schema_tables:
+            errors.append(f"Table `{t}` not found in schema")
+
+    for qualifier, col in refs["columns"]:
+        if qualifier:
+            if qualifier in refs["alias_to_table"]:
+                base_table = refs["alias_to_table"][qualifier]
+                if base_table in schema_tables and col not in schema_index.get(base_table, set()):
+                    errors.append(f"Column `{base_table}.{col}` not found in schema")
+            elif qualifier in schema_tables:
+                if col not in schema_index.get(qualifier, set()):
+                    errors.append(f"Column `{qualifier}.{col}` not found in schema")
+            elif qualifier in refs["derived_aliases"] or qualifier in refs["cte_names"]:
+                # 子查询/CTE 别名列不在基础 schema 中，放过，交给执行器最终判断
+                continue
+            else:
+                # 未知限定符可能来自复杂作用域别名，避免误杀，交给执行器兜底
+                continue
+        else:
+            # 未限定列可能是 SELECT 别名（常见于 ORDER BY / GROUP BY）
+            if col in refs["select_aliases"]:
+                continue
+            # 对未限定列不做硬校验，避免 alias/作用域误判
+            continue
+
+    if errors:
+        return False, "; ".join(errors[:3])
+    return True, None
+
+
+def build_sql_repair_prompt(question, schema, data_flow, vis_transform, vis_config, failed_sql, error_msg):
+    return f"""You are a senior SQL repair engineer.
+
+Task:
+Repair the failed SQL so it is executable on SQLite/DuckDB and remains faithful to the analytics intent.
+
+Context:
+- Question: {question}
+- Target VIS_CONFIG: {vis_config}
+- Schema: {schema}
+- DATA_FLOW: {data_flow}
+- VIS_TRANSFORM: {vis_transform}
+
+Failed SQL:
+```sql
+{failed_sql}
+```
+
+Failure:
+{error_msg}
+
+Hard constraints:
+1. Use only tables/columns in schema.
+2. Keep chart semantics implied by VIS_CONFIG (x/y/classify/sort intent).
+3. Ensure GROUP BY correctness for non-aggregated select items.
+4. Avoid invalid aliases like table.column alias names.
+5. Output exactly one SQL in a fenced sqlite block.
+
+```sqlite
+"""
+
+
+def repair_sql_with_llm(question, schema_str, data_flow, vis_transform, vis_config, failed_sql, error_msg, q_id, db_id, attempt):
+    prompt = build_sql_repair_prompt(
+        question=question,
+        schema=schema_str,
+        data_flow=data_flow,
+        vis_transform=vis_transform,
+        vis_config=vis_config,
+        failed_sql=failed_sql,
+        error_msg=error_msg,
+    )
+    repair_resp = call_llm(
+        prompt,
+        meta={
+            "q_id": str(q_id),
+            "db_id": db_id,
+            "task": "sr2sql_repair",
+            "repair_round": int(attempt),
+        }
+    )
+    repaired_sql = extract_sql(repair_resp)
+    repaired_sql = postprocess_generated_sql(repaired_sql)
+    return repaired_sql
+
+
+def execute_sql_with_repair(con, db_path, initial_sql, context, max_repair_rounds=MAX_SQL_REPAIR_ROUNDS):
+    """
+    执行链路：
+    precheck -> execute
+    如失败则进入 LLM 修复，最多 max_repair_rounds 轮。
+    """
+    current_sql = initial_sql
+    repair_history = []
+
+    for attempt in range(max_repair_rounds + 1):
+        pre_ok, pre_err = schema_precheck_sql(con, db_path, current_sql)
+        precheck_err_msg = f"SCHEMA_PRECHECK_ERROR: {pre_err}" if (not pre_ok and pre_err) else None
+
+        # D2.1: 预检失败不硬拦截，统一尝试执行；执行失败再触发修复。
+        df_gen, gen_err, executed_sql = execute_query_compatible(con, current_sql)
+        if not gen_err:
+            return df_gen, None, executed_sql, repair_history
+        err_msg = str(gen_err)
+
+        history_item = {"round": attempt, "error": err_msg, "sql": current_sql}
+        if precheck_err_msg:
+            history_item["precheck_error"] = precheck_err_msg
+        repair_history.append(history_item)
+
+        if attempt >= max_repair_rounds:
+            return None, err_msg, current_sql, repair_history
+
+        repaired_sql = repair_sql_with_llm(
+            question=context["question"],
+            schema_str=context["schema_str"],
+            data_flow=context["data_flow"],
+            vis_transform=context["vis_transform"],
+            vis_config=context["vis_config_json"],
+            failed_sql=current_sql,
+            error_msg=err_msg,
+            q_id=context["q_id"],
+            db_id=context["db_id"],
+            attempt=attempt + 1,
+        )
+
+        if not repaired_sql:
+            return None, err_msg, current_sql, repair_history
+        if repaired_sql.strip() == current_sql.strip():
+            return None, err_msg, current_sql, repair_history
+        current_sql = repaired_sql
+
+    return None, "Max repair rounds exceeded", current_sql, repair_history
+
 
 def execute_query_compatible(con, sql_str, max_retries=3):
     """
@@ -247,6 +523,121 @@ def execute_query_compatible(con, sql_str, max_retries=3):
             
     return None, "Max auto-fix retries exceeded", current_sql
 
+
+def _strip_identifier_quotes(name):
+    if not name:
+        return ""
+    return str(name).strip().strip("`").strip('"').strip()
+
+
+def rewrite_topn_groupby_anyvalue(sql_str):
+    """
+    D3 语义修复:
+    针对 GROUP BY + ORDER BY ANY_VALUE(x) + LIMIT N 的常见退化写法，
+    改写为“先 TopN 再聚合”，避免把 TopN 语义错误地下沉到聚合后。
+    """
+    if not sql_str:
+        return sql_str
+
+    pattern = re.compile(
+        r"""(?is)^\s*SELECT\s+(?P<select>.+?)\s+FROM\s+(?P<from>.+?)\s+(?P<between>.*?)\s*GROUP\s+BY\s+(?P<group>.+?)\s+ORDER\s+BY\s+(?P<order>.+?)\s+LIMIT\s+(?P<limit>\d+)\s*;?\s*$"""
+    )
+    m = pattern.match(sql_str.strip())
+    if not m:
+        return sql_str
+
+    select_clause = (m.group("select") or "").strip()
+    from_clause = (m.group("from") or "").strip()
+    between_clause = (m.group("between") or "").strip()
+    group_clause = (m.group("group") or "").strip()
+    order_clause = (m.group("order") or "").strip()
+    limit_clause = (m.group("limit") or "").strip()
+
+    if not re.search(r"(?i)\bANY_VALUE\s*\(", order_clause):
+        return sql_str
+    if re.search(r"(?i)\b(join|union|intersect|except)\b", from_clause):
+        return sql_str
+
+    topn_order_clause = re.sub(
+        r"(?is)\bANY_VALUE\s*\(\s*(.*?)\s*\)",
+        r"\1",
+        order_clause,
+    ).strip()
+    if not topn_order_clause:
+        return sql_str
+
+    alias_match = re.match(
+        r"""(?is)^\s*(?P<table>[`"\w\.]+)\s*(?:AS\s+)?(?P<alias>[`"\w]+)?\s*$""",
+        from_clause,
+    )
+    if alias_match:
+        table_name = _strip_identifier_quotes(alias_match.group("table"))
+        alias_name = _strip_identifier_quotes(alias_match.group("alias")) or table_name.split(".")[-1]
+    else:
+        table_name = "__src"
+        alias_name = "__src"
+
+    if not alias_name:
+        alias_name = "__src"
+
+    agg_aliases = re.findall(
+        r"""(?is)\b(?:COUNT|SUM|AVG|MAX|MIN)\s*\([^)]*\)\s+AS\s+([`"\w]+)""",
+        select_clause,
+    )
+    outer_order = ""
+    if agg_aliases:
+        agg_alias = agg_aliases[-1].strip()
+        direction = "DESC" if re.search(r"(?i)\bDESC\b", order_clause) else "ASC"
+        outer_order = f"\nORDER BY {agg_alias} {direction}"
+
+    where_having_segment = ""
+    if between_clause:
+        where_having_segment = " " + between_clause.strip()
+
+    rewritten = (
+        "WITH __topn AS (\n"
+        "    SELECT *\n"
+        f"    FROM {from_clause}{where_having_segment}\n"
+        f"    ORDER BY {topn_order_clause}\n"
+        f"    LIMIT {limit_clause}\n"
+        ")\n"
+        f"SELECT {select_clause}\n"
+        f"FROM __topn AS {_quote_ident(alias_name)}\n"
+        f"GROUP BY {group_clause}"
+        f"{outer_order};"
+    )
+    return rewritten
+
+
+def rewrite_weather_date_count_distinct(sql_str):
+    """
+    D3 语义修复:
+    weather 场景下，按日期粒度分箱统计时，COUNT(date) 常需按“天”去重。
+    将 COUNT(date) 调整为 COUNT(DISTINCT date) 以贴近 VisEval 金标语义。
+    """
+    if not sql_str:
+        return sql_str
+    if not re.search(r"""(?is)\bFROM\s+[`"]?weather[`"]?\b""", sql_str):
+        return sql_str
+    if not re.search(r"(?is)\bGROUP\s+BY\b", sql_str):
+        return sql_str
+    if not re.search(r"(?is)\bstrftime\s*\(", sql_str):
+        return sql_str
+
+    pattern_count_date = re.compile(
+        r"""(?is)\bCOUNT\s*\(\s*(?!DISTINCT\b)([`"]?\w+[`"]?\.)?[`"]?date[`"]?\s*\)"""
+    )
+
+    def _to_distinct(match):
+        full = match.group(0)
+        inner = re.search(r"""(?is)\(\s*(.*?)\s*\)""", full)
+        if not inner:
+            return full
+        arg = inner.group(1).strip()
+        return f"COUNT(DISTINCT {arg})"
+
+    return pattern_count_date.sub(_to_distinct, sql_str)
+
 def sanitize_sql_literals(sql_str):
     """
     统一 SQL 中的字符串常量，避免 LLM 产出的双引号触发 DuckDB Binder 报错。
@@ -262,6 +653,63 @@ def sanitize_sql_literals(sql_str):
         flags=re.IGNORECASE,
     )
     return sql_str
+
+
+def sanitize_sql_aliases(sql_str):
+    """
+    修复易导致 Parser Error 的别名形式：
+    1) AS `table.column` / AS "table.column" -> 下划线别名
+    2) AS table.column -> AS table_column
+    """
+    if not sql_str:
+        return sql_str
+
+    sql_str = re.sub(
+        r'(?i)\bAS\s+`([^`]*\.[^`]*)`',
+        lambda m: f"AS `{m.group(1).replace('.', '_')}`",
+        sql_str
+    )
+    sql_str = re.sub(
+        r'(?i)\bAS\s+"([^"]*\.[^"]*)"',
+        lambda m: f'AS "{m.group(1).replace(".", "_")}"',
+        sql_str
+    )
+    sql_str = re.sub(
+        r'(?i)\bAS\s+([A-Za-z_]\w*\.[A-Za-z_]\w*)\b',
+        lambda m: f"AS {m.group(1).replace('.', '_')}",
+        sql_str
+    )
+    return sql_str
+
+
+def fix_identifier_quote_typos(sql_str):
+    """
+    修复 LLM 常见引号错误（例如 `employees`.`FIRST_NAME' ）。
+    仅针对标识符引号，不处理字符串字面量内容。
+    """
+    if not sql_str:
+        return sql_str
+
+    # 标识符以反引号开头、误以单引号结尾 -> 统一改为反引号闭合
+    sql_str = re.sub(r"`([A-Za-z_][^`']*)'", r"`\1`", sql_str)
+    # 标识符以双引号开头、误以单引号结尾 -> 统一改为双引号闭合
+    sql_str = re.sub(r'"([A-Za-z_][^"\']*)\'', r'"\1"', sql_str)
+    return sql_str
+
+
+def postprocess_generated_sql(sql_str):
+    """
+    Stage 03 SQL 执行前统一清洗入口，减少可修复语法噪声。
+    """
+    if not sql_str:
+        return sql_str
+    cleaned = sanitize_sql_literals(sql_str)
+    cleaned = sanitize_sql_aliases(cleaned)
+    cleaned = fix_identifier_quote_typos(cleaned)
+    cleaned = coerce_weekday_labels(cleaned)
+    cleaned = rewrite_topn_groupby_anyvalue(cleaned)
+    cleaned = rewrite_weather_date_count_distinct(cleaned)
+    return cleaned
 
 
 WEEKDAY_LABELS = [
@@ -393,8 +841,8 @@ def execute_with_timeout(gen_sql, gold_sql, db_path):
     con = get_duckdb_connection(db_path)
     
     # 1.5. 标准化 SQL 字符串常量 & weekday 表达式
-    gen_sql = coerce_weekday_labels(sanitize_sql_literals(gen_sql))
-    gold_sql = coerce_weekday_labels(sanitize_sql_literals(gold_sql))
+    gen_sql = postprocess_generated_sql(gen_sql)
+    gold_sql = postprocess_generated_sql(gold_sql)
 
     # 2. 隔离执行 Gen SQL 和 Gold SQL
     df_gen, gen_err, final_gen_sql = execute_query_compatible(con, gen_sql)
@@ -589,6 +1037,16 @@ def normalize_val(v, is_x_axis=False, gold_samples=None):
 
     return s.lower()
 
+
+def append_stage03_reject(reject_log_path, record):
+    """将 Stage 03 失败样本结构化写入 jsonl。"""
+    try:
+        with open(reject_log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        # 日志写入失败不应影响主流程
+        pass
+
 def validate_against_vis_obj(df_gen, vis_obj):
     """
     更新后的比对函数，传入 X 轴金标样本以支持上下文感知的归一化
@@ -650,6 +1108,9 @@ def validate_and_filter(sft_file_path, dataset_root, output_file_path, target_db
     total = 0
     passed_vis = 0
     passed_sql = 0
+    project_root = os.path.dirname(dataset_root)
+    reject_log_path = os.path.join(project_root, "logs", "stage03_rejects.jsonl")
+    os.makedirs(os.path.dirname(reject_log_path), exist_ok=True)
     
     with open(sft_file_path, 'r', encoding='utf-8') as f:
         lines = f.readlines()
@@ -680,6 +1141,8 @@ def validate_and_filter(sft_file_path, dataset_root, output_file_path, target_db
 
         # 初始化本次循环的日志信息
         report = []
+        fail_events = []
+        gen_sql_for_log = ""
         report.append(f"\n{'='*30} 🔍 EXAMINING ID: {q_id} {'='*30}")
         report.append(f"DB: {db_id} | Q: {question}")
         
@@ -692,6 +1155,10 @@ def validate_and_filter(sft_file_path, dataset_root, output_file_path, target_db
             vis_transform=parsed['vis_transform']
         except Exception as e:
             report.append(f"❌ [PARSE ERROR]: {e}")
+            fail_events.append({
+                "type": "PARSE_ERROR",
+                "reason": str(e),
+            })
             is_parse_ok = False
 
         # --- 1. 校验 VIS_CONFIG ---
@@ -702,24 +1169,40 @@ def validate_and_filter(sft_file_path, dataset_root, output_file_path, target_db
                 report.append(f"❌ [VIS MISMATCH]:")
                 report.append(f"   - Expected: {gold_vis}")
                 report.append(f"   - Got:      {vis_config}")
+                fail_events.append({
+                    "type": "VIS_MISMATCH",
+                    "reason": "predicted VIS_CONFIG does not match gold_vis",
+                    "expected": gold_vis,
+                    "predicted": vis_config,
+                })
             else:
                 passed_vis += 1
 
-        # --- 2. 执行与比对 (仅在 VIS 校验通过后进行，或者你想看全量报错也可以去掉 if) ---
+        # --- 2. 执行与比对（D1：VIS 软门禁，允许 VIS 不匹配样本继续进行 SQL+数据实检） ---
         sql_ok = False
-        if vis_ok:
+        should_attempt_sql = (
+            is_parse_ok
+            and bool(data_flow)
+            and bool(vis_transform)
+            and (vis_config is not None)
+        )
+        if should_attempt_sql:
+            if not vis_ok:
+                report.append("⚠️ [VIS SOFT-GATE]: VIS_CONFIG mismatch, continue SQL/data validation.")
             try:
                 schema_str = item['instruction'].split("based on schema: ")[1]
                 db_path = os.path.join(dataset_root, "databases", db_id)
                 con = get_duckdb_connection(db_path)
+                vis_config_json = json.dumps(vis_config, ensure_ascii=False)
+                repair_history = []
                 
-                # 转换并执行
+                # 先由 SR2SQL 生成初始 SQL
                 prompt = build_sr2sql_check_prompt(
                     schema=schema_str,
                     question=question,
                     data_flow=data_flow,
                     vis_transform=vis_transform,
-                    vis_config=json.dumps(vis_config),
+                    vis_config=vis_config_json,
                 )
                 gen_sql_resp = call_llm(
                     prompt,
@@ -730,7 +1213,7 @@ def validate_and_filter(sft_file_path, dataset_root, output_file_path, target_db
                     }
                 )
                 gen_sql_raw = extract_sql(gen_sql_resp)
-                gen_sql_fixed = coerce_weekday_labels(sanitize_sql_literals(gen_sql_raw))
+                gen_sql_fixed = postprocess_generated_sql(gen_sql_raw)
 
                 # 若 SQL 被修复，尝试同步写回 DVCR
                 if gen_sql_fixed != gen_sql_raw:
@@ -743,12 +1226,38 @@ def validate_and_filter(sft_file_path, dataset_root, output_file_path, target_db
                         item['output'] = dvcr_output
                 else:
                     gen_sql = gen_sql_raw
-                
-                df_gen, gen_err, _ = execute_query_compatible(con, gen_sql)
-                
+                gen_sql_for_log = gen_sql
+
+                # D2: 执行前 schema 约束 + 执行失败自动修复
+                df_gen, gen_err, final_sql_used, repair_history = execute_sql_with_repair(
+                    con=con,
+                    db_path=db_path,
+                    initial_sql=gen_sql,
+                    context={
+                        "question": question,
+                        "schema_str": schema_str,
+                        "data_flow": data_flow,
+                        "vis_transform": vis_transform,
+                        "vis_config_json": vis_config_json,
+                        "q_id": q_id,
+                        "db_id": db_id,
+                    },
+                )
+                if final_sql_used:
+                    gen_sql_for_log = final_sql_used
+
                 if gen_err:
                     report.append(f"❌ [SQL EXEC ERROR]: {gen_err}")
-                    report.append(f"   - GEN SQL: {gen_sql.replace(os.linesep, ' ')}")
+                    report.append(f"   - GEN SQL: {gen_sql_for_log.replace(os.linesep, ' ')}")
+                    if repair_history:
+                        report.append(f"   - REPAIR ROUNDS: {len(repair_history)-1}")
+                    fail_type = "SCHEMA_PRECHECK_ERROR" if str(gen_err).startswith("SCHEMA_PRECHECK_ERROR:") else "SQL_EXEC_ERROR"
+                    fail_events.append({
+                        "type": fail_type,
+                        "reason": str(gen_err),
+                        "gen_sql": gen_sql_for_log,
+                        "repair_history": repair_history,
+                    })
                 else:
                     # 数据比对
                     is_match, msg = validate_against_vis_obj(df_gen, target_vis_obj)
@@ -757,13 +1266,31 @@ def validate_and_filter(sft_file_path, dataset_root, output_file_path, target_db
                         passed_sql += 1
                     else:
                         report.append(f"❌ [DATA MISMATCH]: {msg}")
-                        report.append(f"   - GEN SQL: {gen_sql.replace(os.linesep, ' ')}")
+                        report.append(f"   - GEN SQL: {gen_sql_for_log.replace(os.linesep, ' ')}")
                         # 展示标准答案 vs 模型答案
                         report.append(f"   - GOLD DATA (Sample): {gold_data_preview}")
                         gen_preview = df_gen.head(3).values.tolist()
                         report.append(f"   - GEN DATA (Sample):  {gen_preview}")
+                        fail_events.append({
+                            "type": "DATA_MISMATCH",
+                            "reason": str(msg),
+                            "gen_sql": gen_sql_for_log,
+                            "gold_data_preview": gold_data_preview,
+                            "gen_data_preview": gen_preview,
+                            "repair_history": repair_history,
+                        })
             except Exception as e:
                 report.append(f"❌ [SYSTEM ERROR]: {e}")
+                fail_events.append({
+                    "type": "SYSTEM_ERROR",
+                    "reason": str(e),
+                    "gen_sql": gen_sql_for_log,
+                })
+        else:
+            fail_events.append({
+                "type": "SQL_SKIPPED",
+                "reason": "DVCR parse failed or required sections are missing",
+            })
 
         # --- 判定最终结果 ---
         if sql_ok:
@@ -773,6 +1300,20 @@ def validate_and_filter(sft_file_path, dataset_root, output_file_path, target_db
             # 只有失败时才打印整份报告
             tqdm.write("\n".join(report))
             tqdm.write(f"{'='*80}")
+            append_stage03_reject(
+                reject_log_path,
+                {
+                    "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "run_id": TOKEN_RUN_ID,
+                    "stage": TOKEN_STAGE,
+                    "db_id": db_id,
+                    "id": str(q_id),
+                    "question": question,
+                    "primary_fail_type": fail_events[0]["type"] if fail_events else "UNKNOWN",
+                    "fail_events": fail_events,
+                    "gen_sql": gen_sql_for_log,
+                },
+            )
             
     # 最终汇总
     tqdm.write(f"\n✨ FINAL STATS ✨")
